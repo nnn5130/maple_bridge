@@ -1,37 +1,71 @@
 # maple_bridge
 
-#### 介绍
-ai agent 桥接器
+AI Agent 桥接器 — 通过飞书 Bot 交互，直接驱动 Claude Code 完成编码与调试。
 
-#### 软件架构
-软件架构说明
+## 架构
 
+```
+飞书消息 → WebSocket 长连接 → Claude Code CLI → 结果返回飞书
+```
 
-#### 安装教程
+无需 Anthropic API Key，直接复用本地 Claude Code 的认证和能力。
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+## 快速开始
 
-#### 使用说明
+### 1. 前置条件
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+- Go 1.22+
+- Claude Code CLI 已安装并登录（`claude` 命令可用）
+- 飞书自建应用（启用机器人能力，事件订阅选「长连接」模式）
 
-#### 参与贡献
+### 2. 配置
 
-1.  Fork 本仓库
-2.  新建 Feat_xxx 分支
-3.  提交代码
-4.  新建 Pull Request
+```bash
+cp configs/config.example.yaml configs/config.yaml
+```
 
+编辑 `configs/config.yaml`：
+- `feishu.app_id` / `feishu.app_secret` — 飞书应用凭证
+- `working_dir` — Claude Code 工作目录
+- `allowed_users` — 允许使用的用户 open_id（留空允许所有）
 
-#### 特技
+### 3. 构建 & 运行
 
-1.  使用 Readme\_XXX.md 来支持不同的语言，例如 Readme\_en.md, Readme\_zh.md
-2.  Gitee 官方博客 [blog.gitee.com](https://blog.gitee.com)
-3.  你可以 [https://gitee.com/explore](https://gitee.com/explore) 这个地址来了解 Gitee 上的优秀开源项目
-4.  [GVP](https://gitee.com/gvp) 全称是 Gitee 最有价值开源项目，是综合评定出的优秀开源项目
-5.  Gitee 官方提供的使用手册 [https://gitee.com/help](https://gitee.com/help)
-6.  Gitee 封面人物是一档用来展示 Gitee 会员风采的栏目 [https://gitee.com/gitee-stars/](https://gitee.com/gitee-stars/)
+```bash
+make build
+./bin/maple_bridge configs/config.yaml
+```
+
+### 4. 飞书配置
+
+在飞书开发者后台：
+1. 创建自建应用，启用「机器人」能力
+2. 事件订阅方式选择「使用长连接接收事件」
+3. 添加事件：`im.message.receive_v1`
+
+## 使用
+
+在飞书中给 bot 发消息：
+
+- `帮我看看当前目录下有什么文件`
+- `写一个 Python 脚本计算斐波那契数列并运行`
+- `运行 go test ./... 看看测试结果`
+- `/reset` — 重置对话（开启新的 Claude Code 会话）
+
+## 特性
+
+- 多轮对话：同一用户自动保持 Claude Code 会话上下文
+- 会话过期：空闲 60 分钟后自动清理
+- 长消息分段：超长输出自动拆分为多条飞书消息
+- 用户白名单：可限制访问权限
+
+## 项目结构
+
+```
+cmd/maple_bridge/main.go          # 入口
+internal/
+  config/config.go                 # 配置加载
+  feishu/client.go                 # 飞书 WebSocket + 消息处理
+  claude/runner.go                 # Claude Code CLI 调用 + 会话管理
+configs/config.example.yaml
+```

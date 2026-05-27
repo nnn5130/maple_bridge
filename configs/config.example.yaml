@@ -1,0 +1,20 @@
+# maple_bridge 配置文件
+
+feishu:
+  app_id: "cli_xxxxxxxxxxxx"
+  app_secret: "xxxxxxxxxxxxxxxxxxxx"
+
+claude:
+  path: "claude"  # Claude Code CLI 路径
+
+# 允许使用 bot 的飞书用户 open_id 列表
+# 留空则允许所有用户
+allowed_users: []
+
+# 工作目录：Claude Code 操作的根目录
+working_dir: "/path/to/your/project"
+
+session:
+  max_idle_minutes: 60
+
+log_level: "info"
