@@ -1,4 +1,5 @@
 bin/
 configs/config.yaml
+logs/
 *.exe
 *.test

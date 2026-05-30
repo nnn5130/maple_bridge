@@ -8,12 +8,15 @@ import (
 )
 
 type Config struct {
-	Feishu       FeishuConfig    `yaml:"feishu"`
-	WorkingDir   string          `yaml:"working_dir"`
-	AllowedUsers []string        `yaml:"allowed_users"`
-	Session      SessionConfig   `yaml:"session"`
-	Claude       ClaudeConfig    `yaml:"claude"`
-	LogLevel     string          `yaml:"log_level"`
+	Feishu       FeishuConfig      `yaml:"feishu"`
+	WorkingDir   string            `yaml:"working_dir"`
+	AdminUsers   []string          `yaml:"admin_users"`
+	SuperAdmins  []string          `yaml:"super_admin_users"`
+	AllowedUsers []string          `yaml:"allowed_users"`
+	UserNames    map[string]string `yaml:"user_names"`
+	Session      SessionConfig     `yaml:"session"`
+	Codex        CodexConfig       `yaml:"codex"`
+	LogLevel     string            `yaml:"log_level"`
 }
 
 type FeishuConfig struct {
@@ -21,7 +24,7 @@ type FeishuConfig struct {
 	AppSecret string `yaml:"app_secret"`
 }
 
-type ClaudeConfig struct {
+type CodexConfig struct {
 	Path string `yaml:"path"`
 }
 
@@ -40,8 +43,8 @@ func Load(path string) (*Config, error) {
 		Session: SessionConfig{
 			MaxIdleMinutes: 60,
 		},
-		Claude: ClaudeConfig{
-			Path: "claude",
+		Codex: CodexConfig{
+			Path: "codex",
 		},
 	}
 

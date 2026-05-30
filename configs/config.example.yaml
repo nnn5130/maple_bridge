@@ -4,17 +4,26 @@ feishu:
   app_id: "cli_xxxxxxxxxxxx"
   app_secret: "xxxxxxxxxxxxxxxxxxxx"
 
-claude:
-  path: "claude"  # Claude Code CLI 路径
+codex:
+  path: "/opt/homebrew/bin/codex"  # Codex CLI 路径
 
 # 允许使用 bot 的飞书用户 open_id 列表
 # 留空则允许所有用户
 allowed_users: []
 
-# 工作目录：Claude Code 操作的根目录
+# open_id 到展示昵称的映射，用于 /start、/services、/pid 等输出
+user_names: {}
+
+# 管理员 open_id 列表，可使用 /start、/stop 等后台服务命令
+admin_users: []
+
+# 超级管理员 open_id 列表，可查看/停止所有用户通过 /start 启动的服务
+super_admin_users: []
+
+# 工作目录：Codex 操作的根目录
 working_dir: "/path/to/your/project"
 
 session:
-  max_idle_minutes: 60
+  max_idle_minutes: 30
 
 log_level: "info"

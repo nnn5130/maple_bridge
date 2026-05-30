@@ -1,11 +1,19 @@
 package feishu
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
+	"syscall"
+	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
@@ -13,40 +21,61 @@ import (
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
-	"github.com/maple/maple_bridge/internal/claude"
+	"github.com/maple/maple_bridge/internal/codex"
 	"github.com/maple/maple_bridge/internal/config"
 )
 
 type Client struct {
+	cfgPath   string
+	cfgMu     sync.RWMutex
 	cfg       *config.Config
 	apiClient *lark.Client
-	runner    *claude.Runner
+	runner    *codex.Runner
+	procMu    sync.Mutex
+	procs     map[int]*managedProcess
+	procStore string
 }
 
-func NewClient(cfg *config.Config) (*Client, error) {
+type managedProcess struct {
+	PID         int
+	OwnerUserID string
+	OwnerName   string
+	Command     string
+	WorkDir     string
+	LogPath     string
+	StartedAt   time.Time
+}
+
+func NewClient(cfgPath string, cfg *config.Config) (*Client, error) {
 	apiClient := lark.NewClient(cfg.Feishu.AppID, cfg.Feishu.AppSecret,
 		lark.WithLogReqAtDebug(true),
 		lark.WithLogLevel(larkcore.LogLevelDebug),
 	)
 
-	runner := claude.NewRunner(cfg.Claude.Path, cfg.WorkingDir, cfg.Session.MaxIdleMinutes)
+	runner := codex.NewRunner(cfg.Codex.Path, cfg.WorkingDir, cfg.Session.MaxIdleMinutes)
 
-	return &Client{
+	client := &Client{
+		cfgPath:   cfgPath,
 		cfg:       cfg,
 		apiClient: apiClient,
 		runner:    runner,
-	}, nil
+		procs:     make(map[int]*managedProcess),
+		procStore: filepath.Join(cfg.WorkingDir, ".maple_bridge", "managed_services.json"),
+	}
+	client.restoreManagedServices()
+	return client, nil
 }
 
 func (c *Client) Start(ctx context.Context) error {
+	cfg := c.currentConfig()
 	eventDispatcher := dispatcher.NewEventDispatcher("", "").
 		OnP2MessageReceiveV1(func(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
 			return c.handleMessage(ctx, event)
 		})
 
 	wsClient := larkws.NewClient(
-		c.cfg.Feishu.AppID,
-		c.cfg.Feishu.AppSecret,
+		cfg.Feishu.AppID,
+		cfg.Feishu.AppSecret,
 		larkws.WithEventHandler(eventDispatcher),
 		larkws.WithLogLevel(larkcore.LogLevelDebug),
 	)
@@ -70,6 +99,7 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 		return nil
 	}
 	senderID := *sender.SenderId.OpenId
+	cfg := c.currentConfig()
 
 	senderType := ""
 	if sender.SenderType != nil {
@@ -79,8 +109,20 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 		return nil
 	}
 
-	if !c.isAllowed(senderID) {
+	if !c.isAllowed(cfg, senderID) {
 		slog.Warn("unauthorized user", "sender_id", senderID)
+		return nil
+	}
+
+	isAdmin := c.isAdmin(cfg, senderID)
+	isSuperAdmin := c.isSuperAdmin(cfg, senderID)
+
+	// In group chats, only respond when bot is mentioned (@bot)
+	chatType := ""
+	if msg.ChatType != nil {
+		chatType = *msg.ChatType
+	}
+	if chatType == "group" && !c.isBotMentioned(msg) {
 		return nil
 	}
 
@@ -90,28 +132,96 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 	}
 
 	chatID := *msg.ChatId
+	messageID := *msg.MessageId
 
-	// Special commands
+	// Built-in commands (no AI needed)
 	switch {
+	case text == "/help":
+		c.sendText(ctx, chatID, helpText())
+		return nil
+	case text == "/reload":
+		if !isSuperAdmin {
+			c.sendText(ctx, chatID, "Only super-admin users can reload config.")
+			return nil
+		}
+		c.sendText(ctx, chatID, c.reloadConfig())
+		return nil
 	case text == "/reset":
 		c.runner.Reset(senderID)
 		c.sendText(ctx, chatID, "Session reset.")
 		return nil
+	case text == "/ll":
+		c.sendText(ctx, chatID, c.listWorkDir(senderID))
+		return nil
+	case text == "/workspace":
+		c.sendText(ctx, chatID, c.listDir(cfg.WorkingDir))
+		return nil
+	case strings.HasPrefix(text, "/workspace "):
+		c.sendText(ctx, chatID, "Deprecated: use /cd <dir> to switch directory.")
+		return nil
+	case strings.HasPrefix(text, "/cd "):
+		dir := strings.TrimSpace(strings.TrimPrefix(text, "/cd "))
+		c.sendText(ctx, chatID, c.changeWorkDir(senderID, dir))
+		return nil
+	case text == "/status":
+		sessionID, wd, turns := c.runner.SessionInfo(senderID)
+		c.sendText(ctx, chatID, fmt.Sprintf("Session: %s\nTurns: %d\nWorking dir: %s", sessionID, turns, wd))
+		return nil
+	case text == "/model":
+		c.sendText(ctx, chatID, fmt.Sprintf("Codex CLI: %s", cfg.Codex.Path))
+		return nil
+	case strings.HasPrefix(text, "/run "):
+		cmd := strings.TrimSpace(strings.TrimPrefix(text, "/run "))
+		go c.execCommand(senderID, chatID, cmd)
+		return nil
+	case strings.HasPrefix(text, "/start "):
+		if !isAdmin {
+			c.sendText(ctx, chatID, "Only admin users can start background services.")
+			return nil
+		}
+		command := strings.TrimSpace(strings.TrimPrefix(text, "/start "))
+		go c.startService(senderID, chatID, command)
+		return nil
+	case text == "/services":
+		c.sendText(ctx, chatID, c.listServices(senderID, isSuperAdmin))
+		return nil
+	case text == "/pid":
+		c.sendText(ctx, chatID, c.listServicePIDs(senderID, isSuperAdmin))
+		return nil
+	case strings.HasPrefix(text, "/stop "):
+		if !isAdmin {
+			c.sendText(ctx, chatID, "Only admin users can stop background services.")
+			return nil
+		}
+		pidText := strings.TrimSpace(strings.TrimPrefix(text, "/stop "))
+		c.sendText(ctx, chatID, c.stopService(senderID, isSuperAdmin, pidText))
+		return nil
+	case strings.HasPrefix(text, "/logs "):
+		pidText := strings.TrimSpace(strings.TrimPrefix(text, "/logs "))
+		c.sendText(ctx, chatID, c.serviceLogs(senderID, isSuperAdmin, pidText))
+		return nil
 	}
 
-	slog.Info("processing message", "sender", senderID, "text", truncate(text, 100))
+	slog.Info("processing message", "sender", senderID, "chat_id", chatID, "message_id", messageID, "text", truncate(text, 100))
 
-	go c.process(senderID, chatID, text)
+	go c.process(senderID, chatID, messageID, text, isAdmin)
 	return nil
 }
 
-func (c *Client) process(userID, chatID, text string) {
+func (c *Client) process(userID, chatID, messageID, text string, isAdmin bool) {
 	ctx := context.Background()
+	cardMessageID := c.sendStatusCard(ctx, chatID, "Codex processing", "正在处理请求...", text)
 
-	result, err := c.runner.Run(ctx, userID, text)
+	// Prefix message with Feishu context so Codex knows the origin.
+	prefixed := fmt.Sprintf("[feishu chat_id=%s message_id=%s]\n%s", chatID, messageID, text)
+
+	result, err := c.runner.Run(ctx, userID, prefixed, isAdmin)
 	if err != nil {
-		slog.Error("claude run failed", "error", err)
-		c.sendText(ctx, chatID, fmt.Sprintf("Error: %s", err))
+		slog.Error("codex run failed", "error", err)
+		msg := fmt.Sprintf("Error: %s", err)
+		if cardMessageID == "" || !c.patchStatusCard(ctx, cardMessageID, "Codex failed", msg, text) {
+			c.sendText(ctx, chatID, msg)
+		}
 		return
 	}
 
@@ -120,15 +230,472 @@ func (c *Client) process(userID, chatID, text string) {
 		output = "(no response)"
 	}
 
-	c.sendText(ctx, chatID, output)
-	slog.Info("response sent", "user", userID, "cost", fmt.Sprintf("$%.4f", result.CostUSD))
+	if cardMessageID == "" || !c.patchStatusCard(ctx, cardMessageID, "Codex finished", output, text) {
+		c.sendText(ctx, chatID, output)
+	}
+	slog.Info("response sent", "user", userID)
 }
 
-func (c *Client) isAllowed(userID string) bool {
-	if len(c.cfg.AllowedUsers) == 0 {
+func (c *Client) execCommand(userID, chatID, command string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	wd := c.runner.GetWorkDir(userID)
+	cmd := exec.CommandContext(ctx, "bash", "-c", command)
+	cmd.Dir = wd
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	output := stdout.String()
+	if stderr.String() != "" {
+		output += "\n[stderr]\n" + stderr.String()
+	}
+	if err != nil {
+		output += fmt.Sprintf("\n[error: %s]", err)
+	}
+	if len(output) > 4000 {
+		output = output[:4000] + fmt.Sprintf("\n... (truncated, total %d bytes)", len(output))
+	}
+	if output == "" {
+		output = "(no output)"
+	}
+
+	c.sendText(context.Background(), chatID, output)
+	slog.Info("exec command", "user", userID, "command", command)
+}
+
+func (c *Client) listWorkDir(userID string) string {
+	wd := c.runner.GetWorkDir(userID)
+	return c.listDir(wd)
+}
+
+func (c *Client) listDir(dir string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Sprintf("Directory: %s\n(error reading: %s)", dir, err)
+	}
+	var lines []string
+	lines = append(lines, fmt.Sprintf("📁 %s", dir))
+	for _, e := range entries {
+		if e.IsDir() {
+			lines = append(lines, fmt.Sprintf("  📁 %s/", e.Name()))
+		} else {
+			lines = append(lines, fmt.Sprintf("  📄 %s", e.Name()))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (c *Client) changeWorkDir(userID, dir string) string {
+	if dir == "" {
+		return "Usage: /cd <dir>"
+	}
+
+	base := c.runner.GetWorkDir(userID)
+	target := dir
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(base, target)
+	}
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		return fmt.Sprintf("Invalid path: %s", err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return fmt.Sprintf("Path not found: %s", abs)
+	}
+	if !info.IsDir() {
+		return fmt.Sprintf("Not a directory: %s", abs)
+	}
+	c.runner.SetWorkDir(userID, abs)
+	return fmt.Sprintf("Working directory changed to: %s", abs)
+}
+
+func (c *Client) startService(userID, chatID, command string) {
+	ctx := context.Background()
+	if command == "" {
+		c.sendText(ctx, chatID, "Usage: /start <command>")
+		return
+	}
+
+	wd := c.runner.GetWorkDir(userID)
+	logDir := filepath.Join(wd, ".maple_bridge", "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		c.sendText(ctx, chatID, fmt.Sprintf("Create log dir failed: %s", err))
+		return
+	}
+	logPath := filepath.Join(logDir, fmt.Sprintf("service-%d.log", time.Now().UnixNano()))
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		c.sendText(ctx, chatID, fmt.Sprintf("Create log file failed: %s", err))
+		return
+	}
+
+	cmd := exec.Command("bash", "-lc", command)
+	cmd.Dir = wd
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		c.sendText(ctx, chatID, fmt.Sprintf("Start failed: %s", err))
+		return
+	}
+
+	proc := &managedProcess{
+		PID:         cmd.Process.Pid,
+		OwnerUserID: userID,
+		OwnerName:   c.displayName(c.currentConfig(), userID),
+		Command:     command,
+		WorkDir:     wd,
+		LogPath:     logPath,
+		StartedAt:   time.Now(),
+	}
+	c.procMu.Lock()
+	c.procs[proc.PID] = proc
+	c.saveManagedServicesLocked()
+	c.procMu.Unlock()
+
+	go func() {
+		err := cmd.Wait()
+		_ = logFile.Close()
+		c.procMu.Lock()
+		delete(c.procs, proc.PID)
+		c.saveManagedServicesLocked()
+		c.procMu.Unlock()
+		slog.Info("managed service exited", "pid", proc.PID, "command", command, "error", err)
+	}()
+
+	c.sendText(ctx, chatID, fmt.Sprintf("Started service.\nPID: %d\nOwner: %s (%s)\nWork dir: %s\nLog: %s\nCommand: %s", proc.PID, proc.OwnerName, proc.OwnerUserID, proc.WorkDir, proc.LogPath, proc.Command))
+}
+
+func (c *Client) listServices(userID string, isSuperAdmin bool) string {
+	c.procMu.Lock()
+	defer c.procMu.Unlock()
+	c.pruneManagedServicesLocked()
+
+	var lines []string
+	lines = append(lines, "Managed services:")
+	for _, proc := range c.procs {
+		if !canAccessProcess(userID, isSuperAdmin, proc) {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("PID %d | %s | %s\n  owner: %s (%s)\n  cwd: %s\n  log: %s", proc.PID, time.Since(proc.StartedAt).Round(time.Second), proc.Command, proc.OwnerName, proc.OwnerUserID, proc.WorkDir, proc.LogPath))
+	}
+	if len(lines) == 1 {
+		if isSuperAdmin {
+			return "No managed services."
+		}
+		return "No managed services owned by you."
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (c *Client) listServicePIDs(userID string, isSuperAdmin bool) string {
+	c.procMu.Lock()
+	defer c.procMu.Unlock()
+	c.pruneManagedServicesLocked()
+
+	var lines []string
+	lines = append(lines, "Managed service PIDs:")
+	for _, proc := range c.procs {
+		if !canAccessProcess(userID, isSuperAdmin, proc) {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%d | owner=%s (%s) | %s", proc.PID, proc.OwnerName, proc.OwnerUserID, proc.Command))
+	}
+	if len(lines) == 1 {
+		if isSuperAdmin {
+			return "No managed service PIDs."
+		}
+		return "No managed service PIDs owned by you."
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (c *Client) stopService(userID string, isSuperAdmin bool, pidText string) string {
+	var pid int
+	if _, err := fmt.Sscanf(pidText, "%d", &pid); err != nil || pid <= 0 {
+		return "Usage: /stop <pid>"
+	}
+
+	c.procMu.Lock()
+	proc, ok := c.procs[pid]
+	c.procMu.Unlock()
+	if !ok {
+		return fmt.Sprintf("Managed service not found: %d", pid)
+	}
+	if !processAlive(pid) {
+		c.procMu.Lock()
+		delete(c.procs, pid)
+		c.saveManagedServicesLocked()
+		c.procMu.Unlock()
+		return fmt.Sprintf("Managed service is no longer running: %d", pid)
+	}
+	if !canAccessProcess(userID, isSuperAdmin, proc) {
+		return fmt.Sprintf("Permission denied: PID %d was started by %s (%s)", pid, proc.OwnerName, proc.OwnerUserID)
+	}
+
+	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
+		if procErr := syscall.Kill(pid, syscall.SIGTERM); procErr != nil {
+			return fmt.Sprintf("Stop failed for PID %d: %s", pid, err)
+		}
+	}
+	c.procMu.Lock()
+	delete(c.procs, pid)
+	c.saveManagedServicesLocked()
+	c.procMu.Unlock()
+	return fmt.Sprintf("Stop signal sent to PID %d: %s", pid, proc.Command)
+}
+
+func canAccessProcess(userID string, isSuperAdmin bool, proc *managedProcess) bool {
+	return isSuperAdmin || proc.OwnerUserID == userID
+}
+
+func (c *Client) restoreManagedServices() {
+	data, err := os.ReadFile(c.procStore)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("read managed services store", "path", c.procStore, "error", err)
+		}
+		return
+	}
+	var procs []*managedProcess
+	if err := json.Unmarshal(data, &procs); err != nil {
+		slog.Warn("parse managed services store", "path", c.procStore, "error", err)
+		return
+	}
+
+	c.procMu.Lock()
+	defer c.procMu.Unlock()
+	c.restoreManagedServicesFromListLocked(procs)
+	c.saveManagedServicesLocked()
+	slog.Info("restored managed services", "count", len(c.procs), "store", c.procStore)
+}
+
+func (c *Client) restoreManagedServicesFromStoreLocked() {
+	data, err := os.ReadFile(c.procStore)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("read managed services store", "path", c.procStore, "error", err)
+		}
+		return
+	}
+	var procs []*managedProcess
+	if err := json.Unmarshal(data, &procs); err != nil {
+		slog.Warn("parse managed services store", "path", c.procStore, "error", err)
+		return
+	}
+	c.restoreManagedServicesFromListLocked(procs)
+	c.saveManagedServicesLocked()
+}
+
+func (c *Client) restoreManagedServicesFromListLocked(procs []*managedProcess) {
+	for _, proc := range procs {
+		if proc == nil || proc.PID <= 0 {
+			continue
+		}
+		if !processAlive(proc.PID) {
+			continue
+		}
+		if proc.OwnerName == "" {
+			proc.OwnerName = c.displayName(c.currentConfig(), proc.OwnerUserID)
+		}
+		c.procs[proc.PID] = proc
+	}
+}
+
+func (c *Client) saveManagedServicesLocked() {
+	if err := os.MkdirAll(filepath.Dir(c.procStore), 0o755); err != nil {
+		slog.Warn("create managed services store dir", "path", c.procStore, "error", err)
+		return
+	}
+
+	procs := make([]*managedProcess, 0, len(c.procs))
+	for _, proc := range c.procs {
+		if proc != nil && processAlive(proc.PID) {
+			procs = append(procs, proc)
+		}
+	}
+	data, err := json.MarshalIndent(procs, "", "  ")
+	if err != nil {
+		slog.Warn("marshal managed services store", "error", err)
+		return
+	}
+	if err := os.WriteFile(c.procStore, data, 0o644); err != nil {
+		slog.Warn("write managed services store", "path", c.procStore, "error", err)
+	}
+}
+
+func (c *Client) pruneManagedServicesLocked() {
+	changed := false
+	for pid := range c.procs {
+		if !processAlive(pid) {
+			delete(c.procs, pid)
+			changed = true
+		}
+	}
+	if changed {
+		c.saveManagedServicesLocked()
+	}
+}
+
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || err == syscall.EPERM
+}
+
+func (c *Client) reloadConfig() string {
+	next, err := config.Load(c.cfgPath)
+	if err != nil {
+		return fmt.Sprintf("Reload config failed: %s", err)
+	}
+
+	prev := c.currentConfig()
+	c.cfgMu.Lock()
+	c.cfg = next
+	c.cfgMu.Unlock()
+
+	c.runner = codex.NewRunner(next.Codex.Path, next.WorkingDir, next.Session.MaxIdleMinutes)
+
+	c.procMu.Lock()
+	c.procStore = filepath.Join(next.WorkingDir, ".maple_bridge", "managed_services.json")
+	c.restoreManagedServicesFromStoreLocked()
+	c.procMu.Unlock()
+
+	var notes []string
+	if prev.Feishu.AppID != next.Feishu.AppID || prev.Feishu.AppSecret != next.Feishu.AppSecret {
+		notes = append(notes, "Feishu app_id/app_secret changed; restart bridge to reconnect websocket with the new app.")
+	}
+	if prev.LogLevel != next.LogLevel {
+		notes = append(notes, "log_level changed; restart bridge to rebuild logger level.")
+	}
+	msg := "Config reloaded."
+	if len(notes) > 0 {
+		msg += "\n" + strings.Join(notes, "\n")
+	}
+	return msg
+}
+
+func (c *Client) currentConfig() *config.Config {
+	c.cfgMu.RLock()
+	defer c.cfgMu.RUnlock()
+	return c.cfg
+}
+
+func helpText() string {
+	return strings.Join([]string{
+		"Built-in commands:",
+		"/help - show this help",
+		"/reload - reload config from disk (super-admin only)",
+		"/reset - clear your Codex context and state",
+		"/ll - list current work directory",
+		"/cd <dir> - switch your work directory",
+		"/workspace - list configured workspace root directory",
+		"/status - show Codex context status",
+		"/model - show Codex CLI path",
+		"/run <command> - run a one-shot shell command, 30s timeout",
+		"/start <command> - start a managed background service (admin only)",
+		"/services - list managed background services (admin: own, super-admin: all)",
+		"/pid - list managed service PIDs (admin: own, super-admin: all)",
+		"/logs <pid> - show recent logs for a managed service (admin: own, super-admin: all)",
+		"/stop <pid> - stop a managed service (admin: own, super-admin: all)",
+		"",
+		"Non-command messages are sent to Codex.",
+	}, "\n")
+}
+
+func (c *Client) serviceLogs(userID string, isSuperAdmin bool, pidText string) string {
+	var pid int
+	if _, err := fmt.Sscanf(pidText, "%d", &pid); err != nil || pid <= 0 {
+		return "Usage: /logs <pid>"
+	}
+
+	c.procMu.Lock()
+	proc, ok := c.procs[pid]
+	c.procMu.Unlock()
+	if !ok {
+		return fmt.Sprintf("Managed service not found: %d", pid)
+	}
+	if !processAlive(pid) {
+		c.procMu.Lock()
+		delete(c.procs, pid)
+		c.saveManagedServicesLocked()
+		c.procMu.Unlock()
+		return fmt.Sprintf("Managed service is no longer running: %d", pid)
+	}
+	if !canAccessProcess(userID, isSuperAdmin, proc) {
+		return fmt.Sprintf("Permission denied: PID %d was started by %s (%s)", pid, proc.OwnerName, proc.OwnerUserID)
+	}
+
+	data, err := os.ReadFile(proc.LogPath)
+	if err != nil {
+		return fmt.Sprintf("Read log failed: %s", err)
+	}
+	if len(data) == 0 {
+		return "(log is empty)"
+	}
+	if len(data) > 3500 {
+		data = data[len(data)-3500:]
+	}
+	return string(data)
+}
+
+// isBotMentioned checks if the bot is mentioned in the message.
+func (c *Client) isBotMentioned(msg *larkim.EventMessage) bool {
+	if msg.Mentions == nil {
+		return false
+	}
+	for _, m := range msg.Mentions {
+		if m.Id != nil && m.Id.OpenId != nil && m.MentionedType != nil && *m.MentionedType == "bot" {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) isAllowed(cfg *config.Config, userID string) bool {
+	if len(cfg.AllowedUsers) == 0 {
 		return true
 	}
-	for _, u := range c.cfg.AllowedUsers {
+	for _, u := range cfg.AllowedUsers {
+		if u == userID {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) displayName(cfg *config.Config, userID string) string {
+	if cfg.UserNames != nil {
+		if name := strings.TrimSpace(cfg.UserNames[userID]); name != "" {
+			return name
+		}
+	}
+	return userID
+}
+
+func (c *Client) isAdmin(cfg *config.Config, userID string) bool {
+	if c.isSuperAdmin(cfg, userID) {
+		return true
+	}
+	for _, u := range cfg.AdminUsers {
+		if u == userID {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) isSuperAdmin(cfg *config.Config, userID string) bool {
+	for _, u := range cfg.SuperAdmins {
 		if u == userID {
 			return true
 		}
@@ -154,16 +721,97 @@ func (c *Client) sendText(ctx context.Context, chatID, text string) {
 	}
 }
 
+func (c *Client) sendStatusCard(ctx context.Context, chatID, title, body, request string) string {
+	content := statusCardContent(title, body, request)
+	resp, err := c.apiClient.Im.Message.Create(ctx, larkim.NewCreateMessageReqBuilder().
+		ReceiveIdType("chat_id").
+		Body(larkim.NewCreateMessageReqBodyBuilder().
+			MsgType("interactive").
+			ReceiveId(chatID).
+			Content(content).
+			Build()).
+		Build())
+	if err != nil {
+		slog.Error("send status card", "error", err)
+		return ""
+	}
+	if resp == nil || !resp.Success() || resp.Data == nil || resp.Data.MessageId == nil {
+		slog.Error("send status card failed", "response", resp)
+		return ""
+	}
+	return *resp.Data.MessageId
+}
+
+func (c *Client) patchStatusCard(ctx context.Context, messageID, title, body, request string) bool {
+	content := statusCardContent(title, body, request)
+	resp, err := c.apiClient.Im.Message.Patch(ctx, larkim.NewPatchMessageReqBuilder().
+		MessageId(messageID).
+		Body(&larkim.PatchMessageReqBody{Content: &content}).
+		Build())
+	if err != nil {
+		slog.Error("patch status card", "message_id", messageID, "error", err)
+		return false
+	}
+	if resp == nil || !resp.Success() {
+		slog.Error("patch status card failed", "message_id", messageID, "response", resp)
+		return false
+	}
+	return true
+}
+
+func statusCardContent(title, body, request string) string {
+	card := map[string]any{
+		"config": map[string]any{
+			"wide_screen_mode": true,
+			"update_multi":     true,
+		},
+		"header": map[string]any{
+			"title": map[string]string{
+				"tag":     "plain_text",
+				"content": title,
+			},
+		},
+		"elements": []map[string]any{
+			{
+				"tag":     "div",
+				"content": statusCardText(body),
+			},
+		},
+	}
+	if request != "" {
+		card["elements"] = append(card["elements"].([]map[string]any), map[string]any{
+			"tag":      "note",
+			"elements": []map[string]string{{"tag": "plain_text", "content": "Request: " + truncate(request, 120)}},
+		})
+	}
+	data, _ := json.Marshal(card)
+	return string(data)
+}
+
+func statusCardText(text string) string {
+	if text == "" {
+		text = "(empty)"
+	}
+	if len(text) > 12000 {
+		text = text[:12000] + fmt.Sprintf("\n... (truncated, total %d bytes)", len(text))
+	}
+	return text
+}
+
 func extractText(content string) string {
 	var data map[string]interface{}
 	if err := json.Unmarshal([]byte(content), &data); err != nil {
 		return strings.TrimSpace(content)
 	}
 	if text, ok := data["text"].(string); ok {
+		// Strip @mention placeholders like @_user_1
+		text = mentionRegex.ReplaceAllString(text, "")
 		return strings.TrimSpace(text)
 	}
 	return content
 }
+
+var mentionRegex = regexp.MustCompile(`@_user_\d+\s*`)
 
 func truncate(s string, n int) string {
 	if len(s) <= n {

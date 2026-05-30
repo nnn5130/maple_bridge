@@ -1,0 +1,204 @@
+package codex
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+type Result struct {
+	Text    string
+	IsError bool
+}
+
+type Runner struct {
+	codexPath string
+	workDir   string
+
+	mu      sync.Map // map[string]*sessionInfo
+	maxIdle time.Duration
+}
+
+type sessionInfo struct {
+	lastUsed time.Time
+	turns    int
+	workDir  string
+	history  []historyMessage
+	mu       sync.Mutex
+}
+
+type historyMessage struct {
+	Role      string
+	Content   string
+	CreatedAt time.Time
+}
+
+func NewRunner(codexPath, workDir string, maxIdleMin int) *Runner {
+	r := &Runner{
+		codexPath: codexPath,
+		workDir:   workDir,
+		maxIdle:   time.Duration(maxIdleMin) * time.Minute,
+	}
+	go r.cleanup()
+	return r
+}
+
+// Run executes Codex CLI non-interactively for a single Feishu message.
+func (r *Runner) Run(ctx context.Context, userID, message string, isAdmin bool) (*Result, error) {
+	info := r.getOrCreate(userID)
+	info.mu.Lock()
+	defer info.mu.Unlock()
+	info.lastUsed = time.Now()
+	info.pruneHistory(r.maxIdle)
+
+	wd := info.workDir
+	if wd == "" {
+		wd = r.workDir
+	}
+	prompt := info.promptWithHistory(message, r.maxIdle)
+
+	outputFile, err := os.CreateTemp("", "maple-bridge-codex-*.txt")
+	if err != nil {
+		return nil, fmt.Errorf("create codex output file: %w", err)
+	}
+	outputPath := outputFile.Name()
+	_ = outputFile.Close()
+	defer os.Remove(outputPath)
+
+	args := []string{
+		"exec",
+		"--cd", wd,
+		"--output-last-message", outputPath,
+		"--color", "never",
+		"--skip-git-repo-check",
+	}
+	if isAdmin {
+		args = append(args, "--dangerously-bypass-approvals-and-sandbox")
+	} else {
+		args = append(args, "--sandbox", "workspace-write")
+	}
+	args = append(args, prompt)
+
+	slog.Info("running codex", "work_dir", wd, "message_len", len(message), "prompt_len", len(prompt), "history_messages", len(info.history), "admin", isAdmin)
+
+	cmd := exec.CommandContext(ctx, r.codexPath, args...)
+	cmd.Dir = wd
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("codex cli failed: %w\nstderr: %s\nstdout: %s", err, stderr.String(), stdout.String())
+	}
+
+	output, err := os.ReadFile(outputPath)
+	if err != nil {
+		return nil, fmt.Errorf("read codex output: %w", err)
+	}
+	info.turns++
+	info.history = append(info.history,
+		historyMessage{Role: "user", Content: message, CreatedAt: time.Now()},
+		historyMessage{Role: "assistant", Content: string(output), CreatedAt: time.Now()},
+	)
+
+	return &Result{Text: string(output)}, nil
+}
+
+func (r *Runner) Reset(userID string) {
+	r.mu.Delete(userID)
+}
+
+// SessionInfo returns the current per-user runner state.
+func (r *Runner) SessionInfo(userID string) (sessionID, workDir string, turns int) {
+	info := r.getOrCreate(userID)
+	info.mu.Lock()
+	defer info.mu.Unlock()
+	wd := info.workDir
+	if wd == "" {
+		wd = r.workDir
+	}
+	info.pruneHistory(r.maxIdle)
+	return fmt.Sprintf("codex exec with %d-minute bridge context (%d messages)", int(r.maxIdle.Minutes()), len(info.history)), wd, info.turns
+}
+
+// SetWorkDir updates the working directory for a user's session.
+func (r *Runner) SetWorkDir(userID, dir string) {
+	info := r.getOrCreate(userID)
+	info.mu.Lock()
+	info.workDir = filepath.Clean(dir)
+	info.mu.Unlock()
+}
+
+// GetWorkDir returns the effective working directory for a user.
+func (r *Runner) GetWorkDir(userID string) string {
+	info := r.getOrCreate(userID)
+	info.mu.Lock()
+	defer info.mu.Unlock()
+	if info.workDir != "" {
+		return info.workDir
+	}
+	return r.workDir
+}
+
+func (r *Runner) getOrCreate(userID string) *sessionInfo {
+	val, ok := r.mu.Load(userID)
+	if ok {
+		return val.(*sessionInfo)
+	}
+	info := &sessionInfo{}
+	r.mu.Store(userID, info)
+	return info
+}
+
+func (s *sessionInfo) pruneHistory(maxAge time.Duration) {
+	cutoff := time.Now().Add(-maxAge)
+	kept := s.history[:0]
+	for _, msg := range s.history {
+		if msg.CreatedAt.After(cutoff) {
+			kept = append(kept, msg)
+		}
+	}
+	s.history = kept
+}
+
+func (s *sessionInfo) promptWithHistory(message string, maxAge time.Duration) string {
+	if len(s.history) == 0 {
+		return message
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "You are continuing a Feishu-controlled Codex conversation. The following context contains messages from the last %d minutes. Use it as conversation history, but prioritize the latest user request.\n\n", int(maxAge.Minutes()))
+	b.WriteString("<conversation_context>\n")
+	for _, msg := range s.history {
+		fmt.Fprintf(&b, "%s: %s\n\n", msg.Role, msg.Content)
+	}
+	b.WriteString("</conversation_context>\n\n")
+	b.WriteString("<latest_user_request>\n")
+	b.WriteString(message)
+	b.WriteString("\n</latest_user_request>")
+	return b.String()
+}
+
+func (r *Runner) cleanup() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+		r.mu.Range(func(key, value any) bool {
+			info := value.(*sessionInfo)
+			if now.Sub(info.lastUsed) > r.maxIdle {
+				slog.Info("session expired", "user_id", key)
+				r.mu.Delete(key)
+			}
+			return true
+		})
+	}
+}

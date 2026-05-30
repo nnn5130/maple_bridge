@@ -38,7 +38,7 @@ func main() {
 		cancel()
 	}()
 
-	feishuClient, err := feishu.NewClient(cfg)
+	feishuClient, err := feishu.NewClient(cfgPath, cfg)
 	if err != nil {
 		slog.Error("failed to create feishu client", "error", err)
 		os.Exit(1)
