@@ -161,6 +161,60 @@ func TestSplitMessageKeepsUTF8Valid(t *testing.T) {
 	}
 }
 
+func TestFinalDeliveryForChatTypeAndOutputLength(t *testing.T) {
+	t.Parallel()
+
+	if got := finalDeliveryFor("group", "short output"); got != finalDeliveryReply {
+		t.Fatalf("expected group delivery %q, got %q", finalDeliveryReply, got)
+	}
+	if got := finalDeliveryFor("p2p", "short output"); got != finalDeliveryCard {
+		t.Fatalf("expected private short delivery %q, got %q", finalDeliveryCard, got)
+	}
+	if got := finalDeliveryFor("p2p", strings.Repeat("x", cardPreviewLimit+1)); got != finalDeliveryText {
+		t.Fatalf("expected private long delivery %q, got %q", finalDeliveryText, got)
+	}
+}
+
+func TestFinalCardBodyForGroupUsesSummary(t *testing.T) {
+	t.Parallel()
+
+	body := finalCardBody(finalDeliveryReply, "Codex finished", "full answer should not be embedded", 2*time.Second)
+	if !strings.Contains(body, "结果已在下方回复") {
+		t.Fatalf("expected reply summary, got %q", body)
+	}
+	if strings.Contains(body, "full answer should not be embedded") {
+		t.Fatalf("group card should not embed the full answer: %q", body)
+	}
+}
+
+func TestFinalCardBodyForFailureUsesFailedStatus(t *testing.T) {
+	t.Parallel()
+
+	body := finalCardBody(finalDeliveryText, "Codex failed", strings.Repeat("x", cardPreviewLimit+1), time.Second)
+	if !strings.Contains(body, "处理失败") {
+		t.Fatalf("expected failed status, got %q", body)
+	}
+}
+
+func TestReplyUUIDIsStableUUIDShape(t *testing.T) {
+	t.Parallel()
+
+	got := replyUUID("om_test", 2)
+	if got != replyUUID("om_test", 2) {
+		t.Fatal("expected reply uuid to be stable")
+	}
+	parts := strings.Split(got, "-")
+	lengths := []int{8, 4, 4, 4, 12}
+	if len(parts) != len(lengths) {
+		t.Fatalf("expected uuid shape, got %q", got)
+	}
+	for i, part := range parts {
+		if len(part) != lengths[i] {
+			t.Fatalf("unexpected uuid part %d length in %q", i, got)
+		}
+	}
+}
+
 func testClient(t *testing.T, workspace string) *Client {
 	t.Helper()
 	runner := codex.NewRunner("codex", workspace, 30)

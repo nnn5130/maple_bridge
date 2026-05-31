@@ -3,6 +3,7 @@ package feishu
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -46,8 +47,17 @@ type Client struct {
 const (
 	messageDedupeTTL   = 10 * time.Minute
 	commandOutputLimit = 4000
+	cardPreviewLimit   = 1200
 	stopWaitTimeout    = 3 * time.Second
 	stopPollInterval   = 100 * time.Millisecond
+)
+
+type finalDelivery string
+
+const (
+	finalDeliveryCard  finalDelivery = "card"
+	finalDeliveryText  finalDelivery = "text"
+	finalDeliveryReply finalDelivery = "reply"
 )
 
 type managedProcess struct {
@@ -267,19 +277,18 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 
 	slog.Info("processing message", "sender", senderID, "chat_id", chatID, "message_id", messageID, "text", truncate(text, 100))
 
-	go c.process(senderID, chatID, messageID, text, isAdmin, isSuperAdmin)
+	go c.process(senderID, chatID, messageID, chatType, text, isAdmin, isSuperAdmin)
 	return nil
 }
 
-func (c *Client) process(userID, chatID, messageID, text string, isAdmin, isSuperAdmin bool) {
+func (c *Client) process(userID, chatID, messageID, chatType, text string, isAdmin, isSuperAdmin bool) {
 	ctx := c.backgroundContext()
+	startedAt := time.Now()
 	cardMessageID := c.sendStatusCard(ctx, chatID, "Codex processing", "正在处理请求...", text)
 
 	if err := c.ensureWorkDirAllowed(userID, isSuperAdmin); err != nil {
 		msg := fmt.Sprintf("Error: %s", err)
-		if cardMessageID == "" || !c.patchStatusCard(ctx, cardMessageID, "Codex failed", msg, text) {
-			c.sendText(ctx, chatID, msg)
-		}
+		c.finishResponse(ctx, chatID, messageID, cardMessageID, chatType, "Codex failed", msg, text, startedAt)
 		return
 	}
 
@@ -290,9 +299,7 @@ func (c *Client) process(userID, chatID, messageID, text string, isAdmin, isSupe
 	if err != nil {
 		slog.Error("codex run failed", "error", err)
 		msg := fmt.Sprintf("Error: %s", err)
-		if cardMessageID == "" || !c.patchStatusCard(ctx, cardMessageID, "Codex failed", msg, text) {
-			c.sendText(ctx, chatID, msg)
-		}
+		c.finishResponse(ctx, chatID, messageID, cardMessageID, chatType, "Codex failed", msg, text, startedAt)
 		return
 	}
 
@@ -301,10 +308,60 @@ func (c *Client) process(userID, chatID, messageID, text string, isAdmin, isSupe
 		output = "(no response)"
 	}
 
-	if cardMessageID == "" || !c.patchStatusCard(ctx, cardMessageID, "Codex finished", output, text) {
+	c.finishResponse(ctx, chatID, messageID, cardMessageID, chatType, "Codex finished", output, text, startedAt)
+	slog.Info("response sent", "user", userID)
+}
+
+func (c *Client) finishResponse(ctx context.Context, chatID, originalMessageID, cardMessageID, chatType, title, output, request string, startedAt time.Time) {
+	delivery := finalDeliveryFor(chatType, output)
+	duration := time.Since(startedAt).Round(time.Second)
+	cardBody := finalCardBody(delivery, title, output, duration)
+
+	cardPatched := false
+	if cardMessageID != "" {
+		cardPatched = c.patchStatusCard(ctx, cardMessageID, title, cardBody, request)
+	}
+	if !cardPatched && delivery != finalDeliveryCard {
+		c.sendText(ctx, chatID, cardBody)
+	}
+
+	switch delivery {
+	case finalDeliveryCard:
+		if !cardPatched {
+			c.sendText(ctx, chatID, output)
+		}
+	case finalDeliveryReply:
+		c.sendReplyText(ctx, originalMessageID, chatID, output)
+	case finalDeliveryText:
 		c.sendText(ctx, chatID, output)
 	}
-	slog.Info("response sent", "user", userID)
+
+	slog.Info("final response delivered", "chat_type", chatType, "delivery", delivery, "output_len", len(output), "card_patched", cardPatched, "duration", duration.String())
+}
+
+func finalDeliveryFor(chatType, output string) finalDelivery {
+	if chatType == "group" {
+		return finalDeliveryReply
+	}
+	if len(output) > cardPreviewLimit {
+		return finalDeliveryText
+	}
+	return finalDeliveryCard
+}
+
+func finalCardBody(delivery finalDelivery, title, output string, duration time.Duration) string {
+	status := "处理完成"
+	if strings.Contains(strings.ToLower(title), "failed") {
+		status = "处理失败"
+	}
+	switch delivery {
+	case finalDeliveryReply:
+		return fmt.Sprintf("%s\n耗时：%s\n结果已在下方回复。", status, duration)
+	case finalDeliveryText:
+		return fmt.Sprintf("%s\n耗时：%s\n结果较长，已拆分为下方消息。\n\n预览：\n%s", status, duration, truncate(output, cardPreviewLimit))
+	default:
+		return output
+	}
 }
 
 func (c *Client) execCommand(userID, chatID, command string, isSuperAdmin bool) {
@@ -944,6 +1001,43 @@ func (c *Client) sendText(ctx context.Context, chatID, text string) {
 			slog.Error("send message failed", "response", resp)
 		}
 	}
+}
+
+func (c *Client) sendReplyText(ctx context.Context, messageID, chatID, text string) bool {
+	if messageID == "" {
+		c.sendText(ctx, chatID, text)
+		return false
+	}
+
+	chunks := splitMessage(text, 3500)
+	for i, chunk := range chunks {
+		content, _ := json.Marshal(map[string]string{"text": chunk})
+		resp, err := c.apiClient.Im.Message.Reply(ctx, larkim.NewReplyMessageReqBuilder().
+			MessageId(messageID).
+			Body(larkim.NewReplyMessageReqBodyBuilder().
+				MsgType("text").
+				Content(string(content)).
+				ReplyInThread(false).
+				Uuid(replyUUID(messageID, i)).
+				Build()).
+			Build())
+		if err != nil {
+			slog.Error("reply message", "message_id", messageID, "chunk", i, "error", err)
+			c.sendText(ctx, chatID, strings.Join(chunks[i:], ""))
+			return false
+		}
+		if resp == nil || !resp.Success() {
+			slog.Error("reply message failed", "message_id", messageID, "chunk", i, "response", resp)
+			c.sendText(ctx, chatID, strings.Join(chunks[i:], ""))
+			return false
+		}
+	}
+	return true
+}
+
+func replyUUID(messageID string, chunk int) string {
+	sum := sha1.Sum([]byte(fmt.Sprintf("%s:%d", messageID, chunk)))
+	return fmt.Sprintf("%x-%x-%x-%x-%x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])
 }
 
 func (c *Client) sendStatusCard(ctx context.Context, chatID, title, body, request string) string {

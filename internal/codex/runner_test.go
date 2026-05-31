@@ -37,3 +37,22 @@ func TestTrimHistoryKeepsNewestMessages(t *testing.T) {
 		t.Fatalf("unexpected history after trim: %#v", info.history)
 	}
 }
+
+func TestCodexFailureErrorTruncatesOutput(t *testing.T) {
+	t.Parallel()
+
+	err := codexFailureError(assertionError("boom"), strings.Repeat("s", commandErrorLimit+10), strings.Repeat("o", commandErrorLimit+10))
+	text := err.Error()
+	if !strings.Contains(text, "truncated") {
+		t.Fatalf("expected truncated notice, got %q", text)
+	}
+	if len(text) > commandErrorLimit*3 {
+		t.Fatalf("error text is unexpectedly large: %d", len(text))
+	}
+}
+
+type assertionError string
+
+func (e assertionError) Error() string {
+	return string(e)
+}

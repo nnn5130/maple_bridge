@@ -16,6 +16,7 @@ import (
 
 const (
 	commandOutputLimit     = 64 * 1024
+	commandErrorLimit      = 4000
 	maxHistoryMessages     = 20
 	maxHistoryContentBytes = 32 * 1024
 )
@@ -101,12 +102,13 @@ func (r *Runner) Run(ctx context.Context, userID, message string, isAdmin bool) 
 	} else {
 		args = append(args, "--sandbox", "workspace-write")
 	}
-	args = append(args, prompt)
+	args = append(args, "-")
 
 	slog.Info("running codex", "work_dir", wd, "message_len", len(message), "prompt_len", len(prompt), "history_messages", len(info.history), "admin", isAdmin)
 
 	cmd := exec.CommandContext(ctx, r.codexPath, args...)
 	cmd.Dir = wd
+	cmd.Stdin = strings.NewReader(prompt)
 
 	stdout := newLimitedBuffer(commandOutputLimit)
 	stderr := newLimitedBuffer(commandOutputLimit)
@@ -114,7 +116,7 @@ func (r *Runner) Run(ctx context.Context, userID, message string, isAdmin bool) 
 	cmd.Stderr = stderr
 
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("codex cli failed: %w\nstderr: %s\nstdout: %s", err, stderr.String(), stdout.String())
+		return nil, codexFailureError(err, stderr.String(), stdout.String())
 	}
 
 	output, err := os.ReadFile(outputPath)
@@ -256,6 +258,17 @@ func limitHistoryContent(s string) string {
 		return s
 	}
 	return validPrefix(s, maxHistoryContentBytes) + fmt.Sprintf("\n... (truncated, total %d bytes)", len(s))
+}
+
+func codexFailureError(err error, stderr, stdout string) error {
+	return fmt.Errorf("codex cli failed: %w\nstderr: %s\nstdout: %s", err, truncateWithNotice(stderr, commandErrorLimit), truncateWithNotice(stdout, commandErrorLimit))
+}
+
+func truncateWithNotice(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return validPrefix(s, n) + fmt.Sprintf("\n... (truncated, total %d bytes)", len(s))
 }
 
 func validPrefix(s string, n int) string {
