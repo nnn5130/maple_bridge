@@ -28,6 +28,7 @@ const bridgeInstructions = `Bridge runtime constraints:
 - Do not use the built-in image_gen tool from codex exec.
 - For image-generation or image-editing requests, use a configured image-generation skill or API only when one is available.
 - If no configured image-generation skill or API is available, tell the user that image generation is not supported in this bridge environment.
+- Avoid broad recursive scans from a multi-project workspace root. First inspect the current directory names or a likely project directory, then narrow commands to relevant paths. If the target project is unclear, ask the user to run /cd <dir> or name the project instead of dumping the whole workspace.
 `
 
 type Result struct {
