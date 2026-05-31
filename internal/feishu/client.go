@@ -305,7 +305,7 @@ func (c *Client) process(session sessionRef, userID, chatID, messageID, chatType
 	result, err := c.currentRunner().Run(ctx, session.Key, session.Persistent, prefixed, isAdmin)
 	if err != nil {
 		msg := userFacingError(err)
-		slog.Error("codex run failed", "error", msg)
+		slog.Error("codex run failed", "error", err, "user_error", msg)
 		c.finishResponse(ctx, chatID, messageID, cardMessageID, chatType, "Codex failed", msg, text, startedAt)
 		return
 	}
@@ -1185,6 +1185,30 @@ func extractText(content string) string {
 		// Strip @mention placeholders like @_user_1
 		text = mentionRegex.ReplaceAllString(text, "")
 		return strings.TrimSpace(text)
+	}
+	if blocks, ok := data["content"].([]interface{}); ok {
+		var parts []string
+		for _, block := range blocks {
+			items, ok := block.([]interface{})
+			if !ok {
+				continue
+			}
+			for _, item := range items {
+				obj, ok := item.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if tag, _ := obj["tag"].(string); tag != "text" {
+					continue
+				}
+				if text, ok := obj["text"].(string); ok {
+					parts = append(parts, text)
+				}
+			}
+		}
+		if len(parts) > 0 {
+			return strings.TrimSpace(strings.Join(parts, ""))
+		}
 	}
 	return content
 }

@@ -266,6 +266,16 @@ func TestRedactSensitiveHidesAPIKeys(t *testing.T) {
 	}
 }
 
+func TestExtractTextFromPostContent(t *testing.T) {
+	t.Parallel()
+
+	content := `{"title":"","content":[[{"tag":"at","user_id":"@_user_1","user_name":"螃蟹助手"},{"tag":"text","text":"现在的session管理方案"}]]}`
+	got := extractText(content)
+	if got != "现在的session管理方案" {
+		t.Fatalf("unexpected extracted text: %q", got)
+	}
+}
+
 func testClient(t *testing.T, workspace string) *Client {
 	t.Helper()
 	runner := codex.NewRunner("codex", workspace, 30)
