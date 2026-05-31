@@ -2,6 +2,7 @@ package feishu
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -212,6 +213,29 @@ func TestReplyUUIDIsStableUUIDShape(t *testing.T) {
 		if len(part) != lengths[i] {
 			t.Fatalf("unexpected uuid part %d length in %q", i, got)
 		}
+	}
+}
+
+func TestUserFacingErrorStripsCommandOutput(t *testing.T) {
+	t.Parallel()
+
+	err := errors.New("codex cli failed: exit status 101\nstderr: long internal log\nstdout: noisy output")
+	got := userFacingError(err)
+	if got != "Error: codex cli failed: exit status 101" {
+		t.Fatalf("unexpected user-facing error: %q", got)
+	}
+}
+
+func TestRedactSensitiveHidesAPIKeys(t *testing.T) {
+	t.Parallel()
+
+	input := "use api key sk-exampleSecretToken123456 and keep normal text"
+	got := redactSensitive(input)
+	if strings.Contains(got, "sk-exampleSecretToken123456") {
+		t.Fatalf("expected secret to be redacted: %q", got)
+	}
+	if !strings.Contains(got, "[REDACTED]") || !strings.Contains(got, "keep normal text") {
+		t.Fatalf("unexpected redacted text: %q", got)
 	}
 }
 

@@ -38,6 +38,37 @@ func TestTrimHistoryKeepsNewestMessages(t *testing.T) {
 	}
 }
 
+func TestPromptIncludesBridgeImageGenerationConstraintWithoutHistory(t *testing.T) {
+	t.Parallel()
+
+	info := &sessionInfo{}
+	got := info.promptWithHistory("画一张图", 30)
+	if !strings.Contains(got, "Do not use the built-in image_gen tool") {
+		t.Fatalf("expected image_gen constraint, got %q", got)
+	}
+	if !strings.Contains(got, "image generation is not supported") {
+		t.Fatalf("expected unsupported fallback instruction, got %q", got)
+	}
+	if !strings.Contains(got, "画一张图") {
+		t.Fatalf("expected latest user message, got %q", got)
+	}
+}
+
+func TestPromptIncludesBridgeImageGenerationConstraintWithHistory(t *testing.T) {
+	t.Parallel()
+
+	info := &sessionInfo{
+		history: []historyMessage{{Role: "assistant", Content: "old answer"}},
+	}
+	got := info.promptWithHistory("latest", 30)
+	if !strings.Contains(got, "Do not use the built-in image_gen tool") {
+		t.Fatalf("expected image_gen constraint, got %q", got)
+	}
+	if !strings.Contains(got, "<conversation_context>") || !strings.Contains(got, "<latest_user_request>") {
+		t.Fatalf("expected history prompt structure, got %q", got)
+	}
+}
+
 func TestCodexFailureErrorTruncatesOutput(t *testing.T) {
 	t.Parallel()
 

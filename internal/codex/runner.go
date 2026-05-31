@@ -21,6 +21,12 @@ const (
 	maxHistoryContentBytes = 32 * 1024
 )
 
+const bridgeInstructions = `Bridge runtime constraints:
+- Do not use the built-in image_gen tool from codex exec.
+- For image-generation or image-editing requests, use a configured image-generation skill or API only when one is available.
+- If no configured image-generation skill or API is available, tell the user that image generation is not supported in this bridge environment.
+`
+
 type Result struct {
 	Text    string
 	IsError bool
@@ -205,11 +211,15 @@ func (s *sessionInfo) trimHistory(maxMessages int) {
 }
 
 func (s *sessionInfo) promptWithHistory(message string, maxAge time.Duration) string {
+	var b strings.Builder
+	b.WriteString(bridgeInstructions)
+	b.WriteString("\n")
+
 	if len(s.history) == 0 {
-		return message
+		b.WriteString(message)
+		return b.String()
 	}
 
-	var b strings.Builder
 	fmt.Fprintf(&b, "You are continuing a Feishu-controlled Codex conversation. The following context contains messages from the last %d minutes. Use it as conversation history, but prioritize the latest user request.\n\n", int(maxAge.Minutes()))
 	b.WriteString("<conversation_context>\n")
 	for _, msg := range s.history {

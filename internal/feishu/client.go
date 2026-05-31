@@ -275,7 +275,7 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 		return nil
 	}
 
-	slog.Info("processing message", "sender", senderID, "chat_id", chatID, "message_id", messageID, "text", truncate(text, 100))
+	slog.Info("processing message", "sender", senderID, "chat_id", chatID, "message_id", messageID, "text", truncate(redactSensitive(text), 100))
 
 	go c.process(senderID, chatID, messageID, chatType, text, isAdmin, isSuperAdmin)
 	return nil
@@ -297,8 +297,8 @@ func (c *Client) process(userID, chatID, messageID, chatType, text string, isAdm
 
 	result, err := c.currentRunner().Run(ctx, userID, prefixed, isAdmin)
 	if err != nil {
-		slog.Error("codex run failed", "error", err)
-		msg := fmt.Sprintf("Error: %s", err)
+		msg := userFacingError(err)
+		slog.Error("codex run failed", "error", msg)
 		c.finishResponse(ctx, chatID, messageID, cardMessageID, chatType, "Codex failed", msg, text, startedAt)
 		return
 	}
@@ -362,6 +362,23 @@ func finalCardBody(delivery finalDelivery, title, output string, duration time.D
 	default:
 		return output
 	}
+}
+
+func userFacingError(err error) string {
+	if err == nil {
+		return "Error: unknown error"
+	}
+	text := err.Error()
+	for _, marker := range []string{"\nstderr:", "\nstdout:"} {
+		if idx := strings.Index(text, marker); idx >= 0 {
+			text = text[:idx]
+		}
+	}
+	return "Error: " + strings.TrimSpace(text)
+}
+
+func redactSensitive(text string) string {
+	return secretTokenRegex.ReplaceAllString(text, "[REDACTED]")
 }
 
 func (c *Client) execCommand(userID, chatID, command string, isSuperAdmin bool) {
@@ -1133,7 +1150,10 @@ func extractText(content string) string {
 	return content
 }
 
-var mentionRegex = regexp.MustCompile(`@_user_\d+\s*`)
+var (
+	mentionRegex     = regexp.MustCompile(`@_user_\d+\s*`)
+	secretTokenRegex = regexp.MustCompile(`\b(?:sk|SK)-[A-Za-z0-9_-]{12,}\b`)
+)
 
 type limitedBuffer struct {
 	buf   bytes.Buffer
