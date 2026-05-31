@@ -43,6 +43,7 @@ func main() {
 		slog.Error("failed to create feishu client", "error", err)
 		os.Exit(1)
 	}
+	defer feishuClient.Close()
 
 	slog.Info("starting maple_bridge", "app_id", cfg.Feishu.AppID)
 	if err := feishuClient.Start(ctx); err != nil {

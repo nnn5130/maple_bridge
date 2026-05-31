@@ -11,6 +11,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
+)
+
+const (
+	commandOutputLimit     = 64 * 1024
+	maxHistoryMessages     = 20
+	maxHistoryContentBytes = 32 * 1024
 )
 
 type Result struct {
@@ -22,8 +29,10 @@ type Runner struct {
 	codexPath string
 	workDir   string
 
-	mu      sync.Map // map[string]*sessionInfo
-	maxIdle time.Duration
+	mu       sync.Map // map[string]*sessionInfo
+	maxIdle  time.Duration
+	stop     chan struct{}
+	stopOnce sync.Once
 }
 
 type sessionInfo struct {
@@ -45,9 +54,17 @@ func NewRunner(codexPath, workDir string, maxIdleMin int) *Runner {
 		codexPath: codexPath,
 		workDir:   workDir,
 		maxIdle:   time.Duration(maxIdleMin) * time.Minute,
+		stop:      make(chan struct{}),
 	}
 	go r.cleanup()
 	return r
+}
+
+// Close stops background cleanup for this runner.
+func (r *Runner) Close() {
+	r.stopOnce.Do(func() {
+		close(r.stop)
+	})
 }
 
 // Run executes Codex CLI non-interactively for a single Feishu message.
@@ -55,7 +72,7 @@ func (r *Runner) Run(ctx context.Context, userID, message string, isAdmin bool) 
 	info := r.getOrCreate(userID)
 	info.mu.Lock()
 	defer info.mu.Unlock()
-	info.lastUsed = time.Now()
+	info.touch()
 	info.pruneHistory(r.maxIdle)
 
 	wd := info.workDir
@@ -91,9 +108,10 @@ func (r *Runner) Run(ctx context.Context, userID, message string, isAdmin bool) 
 	cmd := exec.CommandContext(ctx, r.codexPath, args...)
 	cmd.Dir = wd
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout := newLimitedBuffer(commandOutputLimit)
+	stderr := newLimitedBuffer(commandOutputLimit)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("codex cli failed: %w\nstderr: %s\nstdout: %s", err, stderr.String(), stdout.String())
@@ -105,9 +123,11 @@ func (r *Runner) Run(ctx context.Context, userID, message string, isAdmin bool) 
 	}
 	info.turns++
 	info.history = append(info.history,
-		historyMessage{Role: "user", Content: message, CreatedAt: time.Now()},
-		historyMessage{Role: "assistant", Content: string(output), CreatedAt: time.Now()},
+		historyMessage{Role: "user", Content: limitHistoryContent(message), CreatedAt: time.Now()},
+		historyMessage{Role: "assistant", Content: limitHistoryContent(string(output)), CreatedAt: time.Now()},
 	)
+	info.trimHistory(maxHistoryMessages)
+	info.touch()
 
 	return &Result{Text: string(output)}, nil
 }
@@ -121,6 +141,7 @@ func (r *Runner) SessionInfo(userID string) (sessionID, workDir string, turns in
 	info := r.getOrCreate(userID)
 	info.mu.Lock()
 	defer info.mu.Unlock()
+	info.touch()
 	wd := info.workDir
 	if wd == "" {
 		wd = r.workDir
@@ -133,8 +154,9 @@ func (r *Runner) SessionInfo(userID string) (sessionID, workDir string, turns in
 func (r *Runner) SetWorkDir(userID, dir string) {
 	info := r.getOrCreate(userID)
 	info.mu.Lock()
+	defer info.mu.Unlock()
+	info.touch()
 	info.workDir = filepath.Clean(dir)
-	info.mu.Unlock()
 }
 
 // GetWorkDir returns the effective working directory for a user.
@@ -142,6 +164,7 @@ func (r *Runner) GetWorkDir(userID string) string {
 	info := r.getOrCreate(userID)
 	info.mu.Lock()
 	defer info.mu.Unlock()
+	info.touch()
 	if info.workDir != "" {
 		return info.workDir
 	}
@@ -153,9 +176,13 @@ func (r *Runner) getOrCreate(userID string) *sessionInfo {
 	if ok {
 		return val.(*sessionInfo)
 	}
-	info := &sessionInfo{}
-	r.mu.Store(userID, info)
-	return info
+	info := &sessionInfo{lastUsed: time.Now()}
+	actual, _ := r.mu.LoadOrStore(userID, info)
+	return actual.(*sessionInfo)
+}
+
+func (s *sessionInfo) touch() {
+	s.lastUsed = time.Now()
 }
 
 func (s *sessionInfo) pruneHistory(maxAge time.Duration) {
@@ -167,6 +194,12 @@ func (s *sessionInfo) pruneHistory(maxAge time.Duration) {
 		}
 	}
 	s.history = kept
+}
+
+func (s *sessionInfo) trimHistory(maxMessages int) {
+	if maxMessages > 0 && len(s.history) > maxMessages {
+		s.history = s.history[len(s.history)-maxMessages:]
+	}
 }
 
 func (s *sessionInfo) promptWithHistory(message string, maxAge time.Duration) string {
@@ -187,14 +220,73 @@ func (s *sessionInfo) promptWithHistory(message string, maxAge time.Duration) st
 	return b.String()
 }
 
+type limitedBuffer struct {
+	buf   bytes.Buffer
+	limit int
+	total int
+}
+
+func newLimitedBuffer(limit int) *limitedBuffer {
+	return &limitedBuffer{limit: limit}
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	b.total += len(p)
+	if b.limit <= 0 || b.buf.Len() >= b.limit {
+		return len(p), nil
+	}
+	remaining := b.limit - b.buf.Len()
+	if len(p) > remaining {
+		p = p[:remaining]
+	}
+	_, _ = b.buf.Write(p)
+	return len(p), nil
+}
+
+func (b *limitedBuffer) String() string {
+	text := b.buf.String()
+	if b.total > b.limit {
+		text = validPrefix(text, b.limit) + fmt.Sprintf("\n... (truncated, total %d bytes)", b.total)
+	}
+	return text
+}
+
+func limitHistoryContent(s string) string {
+	if len(s) <= maxHistoryContentBytes {
+		return s
+	}
+	return validPrefix(s, maxHistoryContentBytes) + fmt.Sprintf("\n... (truncated, total %d bytes)", len(s))
+}
+
+func validPrefix(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	for n > 0 && !utf8.ValidString(s[:n]) {
+		n--
+	}
+	if n <= 0 {
+		return ""
+	}
+	return s[:n]
+}
+
 func (r *Runner) cleanup() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-ticker.C:
+		case <-r.stop:
+			return
+		}
 		now := time.Now()
 		r.mu.Range(func(key, value any) bool {
 			info := value.(*sessionInfo)
-			if now.Sub(info.lastUsed) > r.maxIdle {
+			info.mu.Lock()
+			expired := now.Sub(info.lastUsed) > r.maxIdle
+			info.mu.Unlock()
+			if expired {
 				slog.Info("session expired", "user_id", key)
 				r.mu.Delete(key)
 			}

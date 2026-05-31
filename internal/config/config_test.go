@@ -49,6 +49,28 @@ allowed_users: []
 	}
 }
 
+func TestLoadRejectsNonPositiveMaxIdleMinutes(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeConfig(t, `
+feishu:
+  app_id: "cli_test"
+  app_secret: "secret"
+working_dir: "`+filepath.ToSlash(t.TempDir())+`"
+allow_all_users: true
+session:
+  max_idle_minutes: 0
+`)
+
+	_, err := Load(configPath)
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "session.max_idle_minutes") {
+		t.Fatalf("expected max_idle_minutes error, got %v", err)
+	}
+}
+
 func writeConfig(t *testing.T, content string) string {
 	t.Helper()
 

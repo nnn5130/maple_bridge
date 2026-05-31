@@ -73,6 +73,9 @@ func (c *Config) validate() error {
 	if c.WorkingDir == "" {
 		return fmt.Errorf("working_dir is required")
 	}
+	if c.Session.MaxIdleMinutes <= 0 {
+		return fmt.Errorf("session.max_idle_minutes must be greater than 0")
+	}
 	info, err := os.Stat(c.WorkingDir)
 	if err != nil {
 		return fmt.Errorf("working_dir %q: %w", c.WorkingDir, err)

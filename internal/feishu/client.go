@@ -15,6 +15,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
@@ -33,10 +34,21 @@ type Client struct {
 	apiClient *lark.Client
 	runnerMu  sync.RWMutex
 	runner    *codex.Runner
+	rootCtxMu sync.RWMutex
+	rootCtx   context.Context
 	procMu    sync.Mutex
 	procs     map[int]*managedProcess
 	procStore string
+	seenMu    sync.Mutex
+	seenMsgs  map[string]time.Time
 }
+
+const (
+	messageDedupeTTL   = 10 * time.Minute
+	commandOutputLimit = 4000
+	stopWaitTimeout    = 3 * time.Second
+	stopPollInterval   = 100 * time.Millisecond
+)
 
 type managedProcess struct {
 	PID         int
@@ -66,12 +78,14 @@ func NewClient(cfgPath string, cfg *config.Config) (*Client, error) {
 		runner:    runner,
 		procs:     make(map[int]*managedProcess),
 		procStore: filepath.Join(cfg.WorkingDir, ".maple_bridge", "managed_services.json"),
+		seenMsgs:  make(map[string]time.Time),
 	}
 	client.restoreManagedServices()
 	return client, nil
 }
 
 func (c *Client) Start(ctx context.Context) error {
+	c.setRootContext(ctx)
 	cfg := c.currentConfig()
 	eventDispatcher := dispatcher.NewEventDispatcher("", "").
 		OnP2MessageReceiveV1(func(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
@@ -89,6 +103,34 @@ func (c *Client) Start(ctx context.Context) error {
 	return wsClient.Start(ctx)
 }
 
+func (c *Client) Close() {
+	if runner := c.currentRunner(); runner != nil {
+		runner.Close()
+	}
+}
+
+func (c *Client) markMessageSeen(messageID string) bool {
+	if messageID == "" {
+		return true
+	}
+	now := time.Now()
+	c.seenMu.Lock()
+	defer c.seenMu.Unlock()
+	if c.seenMsgs == nil {
+		c.seenMsgs = make(map[string]time.Time)
+	}
+	for id, seenAt := range c.seenMsgs {
+		if now.Sub(seenAt) > messageDedupeTTL {
+			delete(c.seenMsgs, id)
+		}
+	}
+	if _, ok := c.seenMsgs[messageID]; ok {
+		return false
+	}
+	c.seenMsgs[messageID] = now
+	return true
+}
+
 func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
 	if event.Event == nil {
 		return nil
@@ -96,6 +138,10 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 
 	msg := event.Event.Message
 	if msg == nil {
+		return nil
+	}
+	if msg.Content == nil || msg.ChatId == nil || msg.MessageId == nil {
+		slog.Warn("message missing required fields")
 		return nil
 	}
 
@@ -138,6 +184,10 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 
 	chatID := *msg.ChatId
 	messageID := *msg.MessageId
+	if !c.markMessageSeen(messageID) {
+		slog.Info("duplicate message ignored", "message_id", messageID, "chat_id", chatID)
+		return nil
+	}
 
 	// Built-in commands (no AI needed)
 	switch {
@@ -222,7 +272,7 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 }
 
 func (c *Client) process(userID, chatID, messageID, text string, isAdmin, isSuperAdmin bool) {
-	ctx := context.Background()
+	ctx := c.backgroundContext()
 	cardMessageID := c.sendStatusCard(ctx, chatID, "Codex processing", "正在处理请求...", text)
 
 	if err := c.ensureWorkDirAllowed(userID, isSuperAdmin); err != nil {
@@ -258,11 +308,11 @@ func (c *Client) process(userID, chatID, messageID, text string, isAdmin, isSupe
 }
 
 func (c *Client) execCommand(userID, chatID, command string, isSuperAdmin bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(c.backgroundContext(), 30*time.Second)
 	defer cancel()
 
 	if err := c.ensureWorkDirAllowed(userID, isSuperAdmin); err != nil {
-		c.sendText(context.Background(), chatID, fmt.Sprintf("Error: %s", err))
+		c.sendText(c.backgroundContext(), chatID, fmt.Sprintf("Error: %s", err))
 		return
 	}
 
@@ -270,26 +320,27 @@ func (c *Client) execCommand(userID, chatID, command string, isSuperAdmin bool) 
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)
 	cmd.Dir = wd
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout := newLimitedBuffer(commandOutputLimit)
+	stderr := newLimitedBuffer(commandOutputLimit)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	err := cmd.Run()
 	output := stdout.String()
-	if stderr.String() != "" {
+	if stderr.Len() > 0 {
 		output += "\n[stderr]\n" + stderr.String()
 	}
 	if err != nil {
 		output += fmt.Sprintf("\n[error: %s]", err)
 	}
 	if len(output) > 4000 {
-		output = output[:4000] + fmt.Sprintf("\n... (truncated, total %d bytes)", len(output))
+		output = truncateWithNotice(output, commandOutputLimit)
 	}
 	if output == "" {
 		output = "(no output)"
 	}
 
-	c.sendText(context.Background(), chatID, output)
+	c.sendText(c.backgroundContext(), chatID, output)
 	slog.Info("exec command", "user", userID, "command", command)
 }
 
@@ -350,7 +401,7 @@ func (c *Client) changeWorkDir(userID, dir string, isSuperAdmin bool) string {
 }
 
 func (c *Client) startService(userID, chatID, command string, isSuperAdmin bool) {
-	ctx := context.Background()
+	ctx := c.backgroundContext()
 	if command == "" {
 		c.sendText(ctx, chatID, "Usage: /start <command>")
 		return
@@ -480,20 +531,34 @@ func (c *Client) stopService(userID string, isSuperAdmin bool, pidText string) s
 		return fmt.Sprintf("Permission denied: PID %d was started by %s (%s)", pid, proc.OwnerName, proc.OwnerUserID)
 	}
 
-	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
-		if procErr := syscall.Kill(pid, syscall.SIGTERM); procErr != nil {
-			return fmt.Sprintf("Stop failed for PID %d: %s", pid, err)
-		}
+	if err := signalManagedProcess(pid, syscall.SIGTERM); err != nil {
+		return fmt.Sprintf("Stop failed for PID %d: %s", pid, err)
 	}
-	c.procMu.Lock()
-	delete(c.procs, pid)
-	c.saveManagedServicesLocked()
-	c.procMu.Unlock()
-	return fmt.Sprintf("Stop signal sent to PID %d: %s", pid, proc.Command)
+	deadline := time.Now().Add(stopWaitTimeout)
+	for time.Now().Before(deadline) {
+		if !managedProcessAlive(proc) {
+			c.procMu.Lock()
+			delete(c.procs, pid)
+			c.saveManagedServicesLocked()
+			c.procMu.Unlock()
+			return fmt.Sprintf("Stopped PID %d: %s", pid, proc.Command)
+		}
+		time.Sleep(stopPollInterval)
+	}
+	return fmt.Sprintf("Stop signal sent to PID %d, but it is still running after %s; keeping it managed: %s", pid, stopWaitTimeout, proc.Command)
 }
 
 func canAccessProcess(userID string, isSuperAdmin bool, proc *managedProcess) bool {
 	return isSuperAdmin || proc.OwnerUserID == userID
+}
+
+func signalManagedProcess(pid int, signal syscall.Signal) error {
+	if err := syscall.Kill(-pid, signal); err != nil {
+		if procErr := syscall.Kill(pid, signal); procErr != nil {
+			return fmt.Errorf("process group: %v; process: %w", err, procErr)
+		}
+	}
+	return nil
 }
 
 func (c *Client) restoreManagedServices() {
@@ -622,7 +687,9 @@ func (c *Client) reloadConfig() string {
 	c.cfg = next
 	c.cfgMu.Unlock()
 
-	c.setRunner(codex.NewRunner(next.Codex.Path, next.WorkingDir, next.Session.MaxIdleMinutes))
+	if oldRunner := c.setRunner(codex.NewRunner(next.Codex.Path, next.WorkingDir, next.Session.MaxIdleMinutes)); oldRunner != nil {
+		oldRunner.Close()
+	}
 
 	c.procMu.Lock()
 	c.procStore = filepath.Join(next.WorkingDir, ".maple_bridge", "managed_services.json")
@@ -655,10 +722,27 @@ func (c *Client) currentRunner() *codex.Runner {
 	return c.runner
 }
 
-func (c *Client) setRunner(runner *codex.Runner) {
+func (c *Client) setRunner(runner *codex.Runner) *codex.Runner {
 	c.runnerMu.Lock()
+	old := c.runner
 	c.runner = runner
 	c.runnerMu.Unlock()
+	return old
+}
+
+func (c *Client) setRootContext(ctx context.Context) {
+	c.rootCtxMu.Lock()
+	c.rootCtx = ctx
+	c.rootCtxMu.Unlock()
+}
+
+func (c *Client) backgroundContext() context.Context {
+	c.rootCtxMu.RLock()
+	defer c.rootCtxMu.RUnlock()
+	if c.rootCtx != nil {
+		return c.rootCtx
+	}
+	return context.Background()
 }
 
 func larkLogLevel(level string) larkcore.LogLevel {
@@ -844,7 +928,7 @@ func (c *Client) sendText(ctx context.Context, chatID, text string) {
 	// Split long messages (Feishu has ~4000 char limit per message)
 	for _, chunk := range splitMessage(text, 3500) {
 		content, _ := json.Marshal(map[string]string{"text": chunk})
-		_, err := c.apiClient.Im.Message.Create(ctx, larkim.NewCreateMessageReqBuilder().
+		resp, err := c.apiClient.Im.Message.Create(ctx, larkim.NewCreateMessageReqBuilder().
 			ReceiveIdType("chat_id").
 			Body(larkim.NewCreateMessageReqBodyBuilder().
 				MsgType("text").
@@ -854,6 +938,10 @@ func (c *Client) sendText(ctx context.Context, chatID, text string) {
 			Build())
 		if err != nil {
 			slog.Error("send message", "error", err)
+			continue
+		}
+		if resp == nil || !resp.Success() {
+			slog.Error("send message failed", "response", resp)
 		}
 	}
 }
@@ -910,8 +998,11 @@ func statusCardContent(title, body, request string) string {
 		},
 		"elements": []map[string]any{
 			{
-				"tag":     "div",
-				"content": statusCardText(body),
+				"tag": "div",
+				"text": map[string]string{
+					"tag":     "lark_md",
+					"content": statusCardText(body),
+				},
 			},
 		},
 	}
@@ -930,7 +1021,7 @@ func statusCardText(text string) string {
 		text = "(empty)"
 	}
 	if len(text) > 12000 {
-		text = text[:12000] + fmt.Sprintf("\n... (truncated, total %d bytes)", len(text))
+		text = truncateWithNotice(text, 12000)
 	}
 	return text
 }
@@ -950,11 +1041,66 @@ func extractText(content string) string {
 
 var mentionRegex = regexp.MustCompile(`@_user_\d+\s*`)
 
+type limitedBuffer struct {
+	buf   bytes.Buffer
+	limit int
+	total int
+}
+
+func newLimitedBuffer(limit int) *limitedBuffer {
+	return &limitedBuffer{limit: limit}
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	b.total += len(p)
+	if b.limit <= 0 || b.buf.Len() >= b.limit {
+		return len(p), nil
+	}
+	remaining := b.limit - b.buf.Len()
+	if len(p) > remaining {
+		p = p[:remaining]
+	}
+	_, _ = b.buf.Write(p)
+	return len(p), nil
+}
+
+func (b *limitedBuffer) Len() int {
+	return b.total
+}
+
+func (b *limitedBuffer) String() string {
+	text := b.buf.String()
+	if b.total > b.limit {
+		text = validPrefix(text, b.limit) + fmt.Sprintf("\n... (truncated, total %d bytes)", b.total)
+	}
+	return text
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return validPrefix(s, n) + "..."
+}
+
+func truncateWithNotice(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return validPrefix(s, n) + fmt.Sprintf("\n... (truncated, total %d bytes)", len(s))
+}
+
+func validPrefix(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	for n > 0 && !utf8.ValidString(s[:n]) {
+		n--
+	}
+	if n <= 0 {
+		return ""
+	}
+	return s[:n]
 }
 
 func splitMessage(text string, maxLen int) []string {
@@ -963,8 +1109,12 @@ func splitMessage(text string, maxLen int) []string {
 	}
 	var chunks []string
 	for len(text) > maxLen {
-		chunks = append(chunks, text[:maxLen])
-		text = text[maxLen:]
+		chunk := validPrefix(text, maxLen)
+		if chunk == "" {
+			chunk = text[:maxLen]
+		}
+		chunks = append(chunks, chunk)
+		text = text[len(chunk):]
 	}
 	if text != "" {
 		chunks = append(chunks, text)
