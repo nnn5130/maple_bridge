@@ -1,6 +1,6 @@
-module github.com/maple/maple_bridge
+module gitee.com/maple_wsy/maple_bridge
 
-go 1.25.0
+go 1.22.0
 
 require (
 	github.com/larksuite/oapi-sdk-go/v3 v3.9.2

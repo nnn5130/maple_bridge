@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -21,8 +22,8 @@ import (
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
-	"github.com/maple/maple_bridge/internal/codex"
-	"github.com/maple/maple_bridge/internal/config"
+	"gitee.com/maple_wsy/maple_bridge/internal/codex"
+	"gitee.com/maple_wsy/maple_bridge/internal/config"
 )
 
 type Client struct {
@@ -30,6 +31,7 @@ type Client struct {
 	cfgMu     sync.RWMutex
 	cfg       *config.Config
 	apiClient *lark.Client
+	runnerMu  sync.RWMutex
 	runner    *codex.Runner
 	procMu    sync.Mutex
 	procs     map[int]*managedProcess
@@ -47,10 +49,13 @@ type managedProcess struct {
 }
 
 func NewClient(cfgPath string, cfg *config.Config) (*Client, error) {
-	apiClient := lark.NewClient(cfg.Feishu.AppID, cfg.Feishu.AppSecret,
-		lark.WithLogReqAtDebug(true),
-		lark.WithLogLevel(larkcore.LogLevelDebug),
-	)
+	apiOptions := []lark.ClientOptionFunc{
+		lark.WithLogLevel(larkLogLevel(cfg.LogLevel)),
+	}
+	if isDebugLogLevel(cfg.LogLevel) {
+		apiOptions = append(apiOptions, lark.WithLogReqAtDebug(true))
+	}
+	apiClient := lark.NewClient(cfg.Feishu.AppID, cfg.Feishu.AppSecret, apiOptions...)
 
 	runner := codex.NewRunner(cfg.Codex.Path, cfg.WorkingDir, cfg.Session.MaxIdleMinutes)
 
@@ -77,7 +82,7 @@ func (c *Client) Start(ctx context.Context) error {
 		cfg.Feishu.AppID,
 		cfg.Feishu.AppSecret,
 		larkws.WithEventHandler(eventDispatcher),
-		larkws.WithLogLevel(larkcore.LogLevelDebug),
+		larkws.WithLogLevel(larkLogLevel(cfg.LogLevel)),
 	)
 
 	slog.Info("connecting to feishu via websocket...")
@@ -147,11 +152,11 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 		c.sendText(ctx, chatID, c.reloadConfig())
 		return nil
 	case text == "/reset":
-		c.runner.Reset(senderID)
+		c.currentRunner().Reset(senderID)
 		c.sendText(ctx, chatID, "Session reset.")
 		return nil
 	case text == "/ll":
-		c.sendText(ctx, chatID, c.listWorkDir(senderID))
+		c.sendText(ctx, chatID, c.listWorkDir(senderID, isSuperAdmin))
 		return nil
 	case text == "/workspace":
 		c.sendText(ctx, chatID, c.listDir(cfg.WorkingDir))
@@ -161,18 +166,26 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 		return nil
 	case strings.HasPrefix(text, "/cd "):
 		dir := strings.TrimSpace(strings.TrimPrefix(text, "/cd "))
-		c.sendText(ctx, chatID, c.changeWorkDir(senderID, dir))
+		c.sendText(ctx, chatID, c.changeWorkDir(senderID, dir, isSuperAdmin))
 		return nil
 	case text == "/status":
-		sessionID, wd, turns := c.runner.SessionInfo(senderID)
+		if err := c.ensureWorkDirAllowed(senderID, isSuperAdmin); err != nil {
+			c.sendText(ctx, chatID, err.Error())
+			return nil
+		}
+		sessionID, wd, turns := c.currentRunner().SessionInfo(senderID)
 		c.sendText(ctx, chatID, fmt.Sprintf("Session: %s\nTurns: %d\nWorking dir: %s", sessionID, turns, wd))
 		return nil
 	case text == "/model":
 		c.sendText(ctx, chatID, fmt.Sprintf("Codex CLI: %s", cfg.Codex.Path))
 		return nil
 	case strings.HasPrefix(text, "/run "):
+		if !isAdmin {
+			c.sendText(ctx, chatID, "Only admin users can run shell commands.")
+			return nil
+		}
 		cmd := strings.TrimSpace(strings.TrimPrefix(text, "/run "))
-		go c.execCommand(senderID, chatID, cmd)
+		go c.execCommand(senderID, chatID, cmd, isSuperAdmin)
 		return nil
 	case strings.HasPrefix(text, "/start "):
 		if !isAdmin {
@@ -180,7 +193,7 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 			return nil
 		}
 		command := strings.TrimSpace(strings.TrimPrefix(text, "/start "))
-		go c.startService(senderID, chatID, command)
+		go c.startService(senderID, chatID, command, isSuperAdmin)
 		return nil
 	case text == "/services":
 		c.sendText(ctx, chatID, c.listServices(senderID, isSuperAdmin))
@@ -204,18 +217,26 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 
 	slog.Info("processing message", "sender", senderID, "chat_id", chatID, "message_id", messageID, "text", truncate(text, 100))
 
-	go c.process(senderID, chatID, messageID, text, isAdmin)
+	go c.process(senderID, chatID, messageID, text, isAdmin, isSuperAdmin)
 	return nil
 }
 
-func (c *Client) process(userID, chatID, messageID, text string, isAdmin bool) {
+func (c *Client) process(userID, chatID, messageID, text string, isAdmin, isSuperAdmin bool) {
 	ctx := context.Background()
 	cardMessageID := c.sendStatusCard(ctx, chatID, "Codex processing", "正在处理请求...", text)
+
+	if err := c.ensureWorkDirAllowed(userID, isSuperAdmin); err != nil {
+		msg := fmt.Sprintf("Error: %s", err)
+		if cardMessageID == "" || !c.patchStatusCard(ctx, cardMessageID, "Codex failed", msg, text) {
+			c.sendText(ctx, chatID, msg)
+		}
+		return
+	}
 
 	// Prefix message with Feishu context so Codex knows the origin.
 	prefixed := fmt.Sprintf("[feishu chat_id=%s message_id=%s]\n%s", chatID, messageID, text)
 
-	result, err := c.runner.Run(ctx, userID, prefixed, isAdmin)
+	result, err := c.currentRunner().Run(ctx, userID, prefixed, isAdmin)
 	if err != nil {
 		slog.Error("codex run failed", "error", err)
 		msg := fmt.Sprintf("Error: %s", err)
@@ -236,11 +257,16 @@ func (c *Client) process(userID, chatID, messageID, text string, isAdmin bool) {
 	slog.Info("response sent", "user", userID)
 }
 
-func (c *Client) execCommand(userID, chatID, command string) {
+func (c *Client) execCommand(userID, chatID, command string, isSuperAdmin bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	wd := c.runner.GetWorkDir(userID)
+	if err := c.ensureWorkDirAllowed(userID, isSuperAdmin); err != nil {
+		c.sendText(context.Background(), chatID, fmt.Sprintf("Error: %s", err))
+		return
+	}
+
+	wd := c.currentRunner().GetWorkDir(userID)
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)
 	cmd.Dir = wd
 
@@ -267,8 +293,11 @@ func (c *Client) execCommand(userID, chatID, command string) {
 	slog.Info("exec command", "user", userID, "command", command)
 }
 
-func (c *Client) listWorkDir(userID string) string {
-	wd := c.runner.GetWorkDir(userID)
+func (c *Client) listWorkDir(userID string, isSuperAdmin bool) string {
+	if err := c.ensureWorkDirAllowed(userID, isSuperAdmin); err != nil {
+		return err.Error()
+	}
+	wd := c.currentRunner().GetWorkDir(userID)
 	return c.listDir(wd)
 }
 
@@ -289,39 +318,50 @@ func (c *Client) listDir(dir string) string {
 	return strings.Join(lines, "\n")
 }
 
-func (c *Client) changeWorkDir(userID, dir string) string {
+func (c *Client) changeWorkDir(userID, dir string, isSuperAdmin bool) string {
 	if dir == "" {
 		return "Usage: /cd <dir>"
 	}
 
-	base := c.runner.GetWorkDir(userID)
+	runner := c.currentRunner()
+	base := runner.GetWorkDir(userID)
 	target := dir
 	if !filepath.IsAbs(target) {
 		target = filepath.Join(base, target)
 	}
-	abs, err := filepath.Abs(target)
+
+	realTarget, err := resolveExistingDir(target)
 	if err != nil {
-		return fmt.Sprintf("Invalid path: %s", err)
+		return fmt.Sprintf("Invalid directory: %s", err)
 	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return fmt.Sprintf("Path not found: %s", abs)
+
+	if !isSuperAdmin {
+		realWorkspace, err := resolveExistingDir(c.currentConfig().WorkingDir)
+		if err != nil {
+			return fmt.Sprintf("Workspace is invalid: %s", err)
+		}
+		if !isPathWithin(realWorkspace, realTarget) {
+			return fmt.Sprintf("Permission denied: admin and regular users are limited to workspace: %s", realWorkspace)
+		}
 	}
-	if !info.IsDir() {
-		return fmt.Sprintf("Not a directory: %s", abs)
-	}
-	c.runner.SetWorkDir(userID, abs)
-	return fmt.Sprintf("Working directory changed to: %s", abs)
+
+	runner.SetWorkDir(userID, realTarget)
+	return fmt.Sprintf("Working directory changed to: %s", realTarget)
 }
 
-func (c *Client) startService(userID, chatID, command string) {
+func (c *Client) startService(userID, chatID, command string, isSuperAdmin bool) {
 	ctx := context.Background()
 	if command == "" {
 		c.sendText(ctx, chatID, "Usage: /start <command>")
 		return
 	}
 
-	wd := c.runner.GetWorkDir(userID)
+	if err := c.ensureWorkDirAllowed(userID, isSuperAdmin); err != nil {
+		c.sendText(ctx, chatID, fmt.Sprintf("Error: %s", err))
+		return
+	}
+
+	wd := c.currentRunner().GetWorkDir(userID)
 	logDir := filepath.Join(wd, ".maple_bridge", "logs")
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		c.sendText(ctx, chatID, fmt.Sprintf("Create log dir failed: %s", err))
@@ -429,7 +469,7 @@ func (c *Client) stopService(userID string, isSuperAdmin bool, pidText string) s
 	if !ok {
 		return fmt.Sprintf("Managed service not found: %d", pid)
 	}
-	if !processAlive(pid) {
+	if !managedProcessAlive(proc) {
 		c.procMu.Lock()
 		delete(c.procs, pid)
 		c.saveManagedServicesLocked()
@@ -499,7 +539,7 @@ func (c *Client) restoreManagedServicesFromListLocked(procs []*managedProcess) {
 		if proc == nil || proc.PID <= 0 {
 			continue
 		}
-		if !processAlive(proc.PID) {
+		if !managedProcessAlive(proc) {
 			continue
 		}
 		if proc.OwnerName == "" {
@@ -517,7 +557,7 @@ func (c *Client) saveManagedServicesLocked() {
 
 	procs := make([]*managedProcess, 0, len(c.procs))
 	for _, proc := range c.procs {
-		if proc != nil && processAlive(proc.PID) {
+		if managedProcessAlive(proc) {
 			procs = append(procs, proc)
 		}
 	}
@@ -533,8 +573,8 @@ func (c *Client) saveManagedServicesLocked() {
 
 func (c *Client) pruneManagedServicesLocked() {
 	changed := false
-	for pid := range c.procs {
-		if !processAlive(pid) {
+	for pid, proc := range c.procs {
+		if !managedProcessAlive(proc) {
 			delete(c.procs, pid)
 			changed = true
 		}
@@ -552,6 +592,25 @@ func processAlive(pid int) bool {
 	return err == nil || err == syscall.EPERM
 }
 
+func managedProcessAlive(proc *managedProcess) bool {
+	if proc == nil || !processAlive(proc.PID) {
+		return false
+	}
+	return processCommandMatches(proc.PID, proc.Command)
+}
+
+func processCommandMatches(pid int, command string) bool {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return false
+	}
+	output, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(strings.TrimSpace(string(output)), command)
+}
+
 func (c *Client) reloadConfig() string {
 	next, err := config.Load(c.cfgPath)
 	if err != nil {
@@ -563,7 +622,7 @@ func (c *Client) reloadConfig() string {
 	c.cfg = next
 	c.cfgMu.Unlock()
 
-	c.runner = codex.NewRunner(next.Codex.Path, next.WorkingDir, next.Session.MaxIdleMinutes)
+	c.setRunner(codex.NewRunner(next.Codex.Path, next.WorkingDir, next.Session.MaxIdleMinutes))
 
 	c.procMu.Lock()
 	c.procStore = filepath.Join(next.WorkingDir, ".maple_bridge", "managed_services.json")
@@ -575,7 +634,7 @@ func (c *Client) reloadConfig() string {
 		notes = append(notes, "Feishu app_id/app_secret changed; restart bridge to reconnect websocket with the new app.")
 	}
 	if prev.LogLevel != next.LogLevel {
-		notes = append(notes, "log_level changed; restart bridge to rebuild logger level.")
+		notes = append(notes, "log_level changed; restart bridge to rebuild logger and Feishu client log levels.")
 	}
 	msg := "Config reloaded."
 	if len(notes) > 0 {
@@ -590,6 +649,84 @@ func (c *Client) currentConfig() *config.Config {
 	return c.cfg
 }
 
+func (c *Client) currentRunner() *codex.Runner {
+	c.runnerMu.RLock()
+	defer c.runnerMu.RUnlock()
+	return c.runner
+}
+
+func (c *Client) setRunner(runner *codex.Runner) {
+	c.runnerMu.Lock()
+	c.runner = runner
+	c.runnerMu.Unlock()
+}
+
+func larkLogLevel(level string) larkcore.LogLevel {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		return larkcore.LogLevelDebug
+	case "warn":
+		return larkcore.LogLevelWarn
+	case "error":
+		return larkcore.LogLevelError
+	default:
+		return larkcore.LogLevelInfo
+	}
+}
+
+func isDebugLogLevel(level string) bool {
+	return strings.EqualFold(strings.TrimSpace(level), "debug")
+}
+
+func resolveExistingDir(dir string) (string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", abs, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%s is not a directory", abs)
+	}
+	realPath, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
+	return realPath, nil
+}
+
+func (c *Client) ensureWorkDirAllowed(userID string, isSuperAdmin bool) error {
+	if isSuperAdmin {
+		return nil
+	}
+
+	realWorkspace, err := resolveExistingDir(c.currentConfig().WorkingDir)
+	if err != nil {
+		return fmt.Errorf("workspace is invalid: %w", err)
+	}
+
+	runner := c.currentRunner()
+	realCurrent, err := resolveExistingDir(runner.GetWorkDir(userID))
+	if err != nil || !isPathWithin(realWorkspace, realCurrent) {
+		runner.SetWorkDir(userID, realWorkspace)
+		return nil
+	}
+	if realCurrent != runner.GetWorkDir(userID) {
+		runner.SetWorkDir(userID, realCurrent)
+	}
+	return nil
+}
+
+func isPathWithin(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
+}
+
 func helpText() string {
 	return strings.Join([]string{
 		"Built-in commands:",
@@ -597,11 +734,11 @@ func helpText() string {
 		"/reload - reload config from disk (super-admin only)",
 		"/reset - clear your Codex context and state",
 		"/ll - list current work directory",
-		"/cd <dir> - switch your work directory",
+		"/cd <dir> - switch your work directory (super-admin: any dir, others: workspace only)",
 		"/workspace - list configured workspace root directory",
 		"/status - show Codex context status",
 		"/model - show Codex CLI path",
-		"/run <command> - run a one-shot shell command, 30s timeout",
+		"/run <command> - run a one-shot shell command, 30s timeout (admin only)",
 		"/start <command> - start a managed background service (admin only)",
 		"/services - list managed background services (admin: own, super-admin: all)",
 		"/pid - list managed service PIDs (admin: own, super-admin: all)",
@@ -624,7 +761,7 @@ func (c *Client) serviceLogs(userID string, isSuperAdmin bool, pidText string) s
 	if !ok {
 		return fmt.Sprintf("Managed service not found: %d", pid)
 	}
-	if !processAlive(pid) {
+	if !managedProcessAlive(proc) {
 		c.procMu.Lock()
 		delete(c.procs, pid)
 		c.saveManagedServicesLocked()
@@ -662,7 +799,7 @@ func (c *Client) isBotMentioned(msg *larkim.EventMessage) bool {
 }
 
 func (c *Client) isAllowed(cfg *config.Config, userID string) bool {
-	if len(cfg.AllowedUsers) == 0 {
+	if cfg.AllowAllUsers {
 		return true
 	}
 	for _, u := range cfg.AllowedUsers {

@@ -1,5 +1,14 @@
 bin/
 configs/config.yaml
 logs/
+/maple_bridge
+.claude/
+.maple_bridge/
+.env
+.env.*
+!.env.example
+.DS_Store
+coverage.out
+*.log
 *.exe
 *.test

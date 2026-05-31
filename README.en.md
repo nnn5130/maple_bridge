@@ -1,36 +1,75 @@
 # maple_bridge
 
-#### Description
-ai agent 桥接器
+A personal self-hosted coding assistant that lets you control the Codex CLI on your own computer from Feishu/Lark.
 
-#### Software Architecture
-Software architecture description
+## What It Does
 
-#### Installation
+```
+Feishu message -> WebSocket event -> local Codex CLI -> Feishu response
+```
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+The bridge reuses your local Codex CLI authentication and local filesystem access. Anyone who can use this bot effectively gets the ability to ask Codex and admin commands to operate on your computer as the current OS user.
 
-#### Instructions
+## Quick Start
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+### Prerequisites
 
-#### Contribution
+- Go 1.22+
+- Codex CLI installed and logged in
+- A Feishu/Lark custom app with bot capability and WebSocket event subscription enabled
 
-1.  Fork the repository
-2.  Create Feat_xxx branch
-3.  Commit your code
-4.  Create Pull Request
+### Configure
 
+```bash
+cp configs/config.example.yaml configs/config.yaml
+```
 
-#### Gitee Feature
+Edit `configs/config.yaml`:
 
-1.  You can use Readme\_XXX.md to support different languages, such as Readme\_en.md, Readme\_zh.md
-2.  Gitee blog [blog.gitee.com](https://blog.gitee.com)
-3.  Explore open source project [https://gitee.com/explore](https://gitee.com/explore)
-4.  The most valuable open source project [GVP](https://gitee.com/gvp)
-5.  The manual of Gitee [https://gitee.com/help](https://gitee.com/help)
-6.  The most popular members  [https://gitee.com/gitee-stars/](https://gitee.com/gitee-stars/)
+- `feishu.app_id` and `feishu.app_secret`: your Feishu/Lark app credentials
+- `working_dir`: the default workspace for Codex
+- `allow_all_users`: keep this `false` for personal use
+- `allowed_users`: Feishu/Lark user open IDs allowed to use the bot
+- `admin_users`: users allowed to run shell commands and manage services
+- `super_admin_users`: users allowed to manage all services and `cd` outside the workspace
+
+### Run
+
+Foreground:
+
+```bash
+make run
+```
+
+macOS LaunchAgent restart:
+
+```bash
+make restart
+```
+
+## Commands
+
+- `/help`: show command help
+- `/reload`: reload config from disk, super-admin only
+- `/reset`: clear your Codex context
+- `/workspace`: list the configured workspace root
+- `/ll`: list your current working directory
+- `/cd <dir>`: switch directory; super-admin can access all directories, other users stay inside `working_dir`
+- `/status`: show session status
+- `/run <command>`: run a one-shot shell command, admin only
+- `/start <command>`: start a managed background service, admin only
+- `/services`: list managed services
+- `/pid`: list managed service PIDs
+- `/logs <pid>`: show service logs
+- `/stop <pid>`: stop a managed service, admin only
+
+## Security Notes
+
+- For personal use, put only your own open ID in `allowed_users`, `admin_users`, and `super_admin_users`.
+- Avoid adding this bot to large group chats.
+- Do not commit `configs/config.yaml`, local logs, Codex credentials, or `.maple_bridge/` runtime files.
+- Admin commands run with the permissions of your local OS user.
+
+## License
+
+Apache License 2.0

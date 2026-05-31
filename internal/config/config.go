@@ -8,15 +8,16 @@ import (
 )
 
 type Config struct {
-	Feishu       FeishuConfig      `yaml:"feishu"`
-	WorkingDir   string            `yaml:"working_dir"`
-	AdminUsers   []string          `yaml:"admin_users"`
-	SuperAdmins  []string          `yaml:"super_admin_users"`
-	AllowedUsers []string          `yaml:"allowed_users"`
-	UserNames    map[string]string `yaml:"user_names"`
-	Session      SessionConfig     `yaml:"session"`
-	Codex        CodexConfig       `yaml:"codex"`
-	LogLevel     string            `yaml:"log_level"`
+	Feishu        FeishuConfig      `yaml:"feishu"`
+	WorkingDir    string            `yaml:"working_dir"`
+	AllowAllUsers bool              `yaml:"allow_all_users"`
+	AdminUsers    []string          `yaml:"admin_users"`
+	SuperAdmins   []string          `yaml:"super_admin_users"`
+	AllowedUsers  []string          `yaml:"allowed_users"`
+	UserNames     map[string]string `yaml:"user_names"`
+	Session       SessionConfig     `yaml:"session"`
+	Codex         CodexConfig       `yaml:"codex"`
+	LogLevel      string            `yaml:"log_level"`
 }
 
 type FeishuConfig struct {
@@ -65,6 +66,9 @@ func (c *Config) validate() error {
 	}
 	if c.Feishu.AppSecret == "" {
 		return fmt.Errorf("feishu.app_secret is required")
+	}
+	if !c.AllowAllUsers && len(c.AllowedUsers) == 0 {
+		return fmt.Errorf("allowed_users is required unless allow_all_users is true")
 	}
 	if c.WorkingDir == "" {
 		return fmt.Errorf("working_dir is required")

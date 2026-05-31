@@ -7,18 +7,26 @@ feishu:
 codex:
   path: "/opt/homebrew/bin/codex"  # Codex CLI 路径
 
-# 允许使用 bot 的飞书用户 open_id 列表
-# 留空则允许所有用户
-allowed_users: []
+# 是否允许所有飞书用户使用 bot。
+# 个人代码助手场景建议保持 false，只把自己的 open_id 放进 allowed_users。
+allow_all_users: false
+
+# 允许使用 bot 的飞书用户 open_id 列表。
+# allow_all_users=false 时必须至少配置一个用户。
+allowed_users:
+  - "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 # open_id 到展示昵称的映射，用于 /start、/services、/pid 等输出
 user_names: {}
 
-# 管理员 open_id 列表，可使用 /start、/stop 等后台服务命令
-admin_users: []
+# 管理员 open_id 列表，可使用 /run、/start、/stop 等后台服务命令
+admin_users:
+  - "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
-# 超级管理员 open_id 列表，可查看/停止所有用户通过 /start 启动的服务
-super_admin_users: []
+# 超级管理员 open_id 列表，可查看/停止所有用户通过 /start 启动的服务，
+# 且 /cd 不受 working_dir 限制。
+super_admin_users:
+  - "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 # 工作目录：Codex 操作的根目录
 working_dir: "/path/to/your/project"

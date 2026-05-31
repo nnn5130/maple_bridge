@@ -7,8 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/maple/maple_bridge/internal/config"
-	"github.com/maple/maple_bridge/internal/feishu"
+	"gitee.com/maple_wsy/maple_bridge/internal/config"
+	"gitee.com/maple_wsy/maple_bridge/internal/feishu"
 )
 
 func main() {
