@@ -70,6 +70,12 @@ type managedProcess struct {
 	StartedAt   time.Time
 }
 
+type sessionRef struct {
+	Key        string
+	Persistent bool
+	Label      string
+}
+
 func NewClient(cfgPath string, cfg *config.Config) (*Client, error) {
 	apiOptions := []lark.ClientOptionFunc{
 		lark.WithLogLevel(larkLogLevel(cfg.LogLevel)),
@@ -194,6 +200,7 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 
 	chatID := *msg.ChatId
 	messageID := *msg.MessageId
+	session := messageSession(msg)
 	if !c.markMessageSeen(messageID) {
 		slog.Info("duplicate message ignored", "message_id", messageID, "chat_id", chatID)
 		return nil
@@ -212,11 +219,11 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 		c.sendText(ctx, chatID, c.reloadConfig())
 		return nil
 	case text == "/reset":
-		c.currentRunner().Reset(senderID)
+		c.currentRunner().Reset(session.Key, session.Persistent)
 		c.sendText(ctx, chatID, "Session reset.")
 		return nil
 	case text == "/ll":
-		c.sendText(ctx, chatID, c.listWorkDir(senderID, isSuperAdmin))
+		c.sendText(ctx, chatID, c.listWorkDir(session, isSuperAdmin))
 		return nil
 	case text == "/workspace":
 		c.sendText(ctx, chatID, c.listDir(cfg.WorkingDir))
@@ -226,15 +233,15 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 		return nil
 	case strings.HasPrefix(text, "/cd "):
 		dir := strings.TrimSpace(strings.TrimPrefix(text, "/cd "))
-		c.sendText(ctx, chatID, c.changeWorkDir(senderID, dir, isSuperAdmin))
+		c.sendText(ctx, chatID, c.changeWorkDir(session, dir, isSuperAdmin))
 		return nil
 	case text == "/status":
-		if err := c.ensureWorkDirAllowed(senderID, isSuperAdmin); err != nil {
+		if err := c.ensureWorkDirAllowed(session, isSuperAdmin); err != nil {
 			c.sendText(ctx, chatID, err.Error())
 			return nil
 		}
-		sessionID, wd, turns := c.currentRunner().SessionInfo(senderID)
-		c.sendText(ctx, chatID, fmt.Sprintf("Session: %s\nTurns: %d\nWorking dir: %s", sessionID, turns, wd))
+		sessionID, wd, turns := c.currentRunner().SessionInfo(session.Key, session.Persistent)
+		c.sendText(ctx, chatID, fmt.Sprintf("Session: %s\nScope: %s\nTurns: %d\nWorking dir: %s", sessionID, session.Label, turns, wd))
 		return nil
 	case text == "/model":
 		c.sendText(ctx, chatID, fmt.Sprintf("Codex CLI: %s", cfg.Codex.Path))
@@ -245,7 +252,7 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 			return nil
 		}
 		cmd := strings.TrimSpace(strings.TrimPrefix(text, "/run "))
-		go c.execCommand(senderID, chatID, cmd, isSuperAdmin)
+		go c.execCommand(session, senderID, chatID, cmd, isSuperAdmin)
 		return nil
 	case strings.HasPrefix(text, "/start "):
 		if !isAdmin {
@@ -253,7 +260,7 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 			return nil
 		}
 		command := strings.TrimSpace(strings.TrimPrefix(text, "/start "))
-		go c.startService(senderID, chatID, command, isSuperAdmin)
+		go c.startService(session, senderID, chatID, command, isSuperAdmin)
 		return nil
 	case text == "/services":
 		c.sendText(ctx, chatID, c.listServices(senderID, isSuperAdmin))
@@ -277,25 +284,25 @@ func (c *Client) handleMessage(ctx context.Context, event *larkim.P2MessageRecei
 
 	slog.Info("processing message", "sender", senderID, "chat_id", chatID, "message_id", messageID, "text", truncate(redactSensitive(text), 100))
 
-	go c.process(senderID, chatID, messageID, chatType, text, isAdmin, isSuperAdmin)
+	go c.process(session, senderID, chatID, messageID, chatType, text, isAdmin, isSuperAdmin)
 	return nil
 }
 
-func (c *Client) process(userID, chatID, messageID, chatType, text string, isAdmin, isSuperAdmin bool) {
+func (c *Client) process(session sessionRef, userID, chatID, messageID, chatType, text string, isAdmin, isSuperAdmin bool) {
 	ctx := c.backgroundContext()
 	startedAt := time.Now()
 	cardMessageID := c.sendStatusCard(ctx, chatID, "Codex processing", "正在处理请求...", text)
 
-	if err := c.ensureWorkDirAllowed(userID, isSuperAdmin); err != nil {
+	if err := c.ensureWorkDirAllowed(session, isSuperAdmin); err != nil {
 		msg := fmt.Sprintf("Error: %s", err)
 		c.finishResponse(ctx, chatID, messageID, cardMessageID, chatType, "Codex failed", msg, text, startedAt)
 		return
 	}
 
 	// Prefix message with Feishu context so Codex knows the origin.
-	prefixed := fmt.Sprintf("[feishu chat_id=%s message_id=%s]\n%s", chatID, messageID, text)
+	prefixed := fmt.Sprintf("[feishu chat_id=%s message_id=%s sender=%s sender_name=%s session=%s]\n%s", chatID, messageID, userID, c.displayName(c.currentConfig(), userID), session.Label, text)
 
-	result, err := c.currentRunner().Run(ctx, userID, prefixed, isAdmin)
+	result, err := c.currentRunner().Run(ctx, session.Key, session.Persistent, prefixed, isAdmin)
 	if err != nil {
 		msg := userFacingError(err)
 		slog.Error("codex run failed", "error", msg)
@@ -364,6 +371,38 @@ func finalCardBody(delivery finalDelivery, title, output string, duration time.D
 	}
 }
 
+func messageSession(msg *larkim.EventMessage) sessionRef {
+	if msg == nil {
+		return sessionRef{Key: "chat:unknown", Label: "chat unknown"}
+	}
+	chatID := strings.TrimSpace(stringValue(msg.ChatId))
+	if chatID == "" {
+		chatID = "unknown"
+	}
+	rootID := strings.TrimSpace(stringValue(msg.RootId))
+	if rootID == "" {
+		rootID = strings.TrimSpace(stringValue(msg.ParentId))
+	}
+	if rootID != "" {
+		return sessionRef{
+			Key:        "topic:" + chatID + ":" + rootID,
+			Persistent: true,
+			Label:      "topic " + rootID,
+		}
+	}
+	return sessionRef{
+		Key:   "chat:" + chatID,
+		Label: "chat " + chatID,
+	}
+}
+
+func stringValue(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
 func userFacingError(err error) string {
 	if err == nil {
 		return "Error: unknown error"
@@ -381,16 +420,16 @@ func redactSensitive(text string) string {
 	return secretTokenRegex.ReplaceAllString(text, "[REDACTED]")
 }
 
-func (c *Client) execCommand(userID, chatID, command string, isSuperAdmin bool) {
+func (c *Client) execCommand(session sessionRef, userID, chatID, command string, isSuperAdmin bool) {
 	ctx, cancel := context.WithTimeout(c.backgroundContext(), 30*time.Second)
 	defer cancel()
 
-	if err := c.ensureWorkDirAllowed(userID, isSuperAdmin); err != nil {
+	if err := c.ensureWorkDirAllowed(session, isSuperAdmin); err != nil {
 		c.sendText(c.backgroundContext(), chatID, fmt.Sprintf("Error: %s", err))
 		return
 	}
 
-	wd := c.currentRunner().GetWorkDir(userID)
+	wd := c.currentRunner().GetWorkDir(session.Key, session.Persistent)
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)
 	cmd.Dir = wd
 
@@ -418,11 +457,11 @@ func (c *Client) execCommand(userID, chatID, command string, isSuperAdmin bool) 
 	slog.Info("exec command", "user", userID, "command", command)
 }
 
-func (c *Client) listWorkDir(userID string, isSuperAdmin bool) string {
-	if err := c.ensureWorkDirAllowed(userID, isSuperAdmin); err != nil {
+func (c *Client) listWorkDir(session sessionRef, isSuperAdmin bool) string {
+	if err := c.ensureWorkDirAllowed(session, isSuperAdmin); err != nil {
 		return err.Error()
 	}
-	wd := c.currentRunner().GetWorkDir(userID)
+	wd := c.currentRunner().GetWorkDir(session.Key, session.Persistent)
 	return c.listDir(wd)
 }
 
@@ -443,13 +482,13 @@ func (c *Client) listDir(dir string) string {
 	return strings.Join(lines, "\n")
 }
 
-func (c *Client) changeWorkDir(userID, dir string, isSuperAdmin bool) string {
+func (c *Client) changeWorkDir(session sessionRef, dir string, isSuperAdmin bool) string {
 	if dir == "" {
 		return "Usage: /cd <dir>"
 	}
 
 	runner := c.currentRunner()
-	base := runner.GetWorkDir(userID)
+	base := runner.GetWorkDir(session.Key, session.Persistent)
 	target := dir
 	if !filepath.IsAbs(target) {
 		target = filepath.Join(base, target)
@@ -470,23 +509,23 @@ func (c *Client) changeWorkDir(userID, dir string, isSuperAdmin bool) string {
 		}
 	}
 
-	runner.SetWorkDir(userID, realTarget)
+	runner.SetWorkDir(session.Key, session.Persistent, realTarget)
 	return fmt.Sprintf("Working directory changed to: %s", realTarget)
 }
 
-func (c *Client) startService(userID, chatID, command string, isSuperAdmin bool) {
+func (c *Client) startService(session sessionRef, userID, chatID, command string, isSuperAdmin bool) {
 	ctx := c.backgroundContext()
 	if command == "" {
 		c.sendText(ctx, chatID, "Usage: /start <command>")
 		return
 	}
 
-	if err := c.ensureWorkDirAllowed(userID, isSuperAdmin); err != nil {
+	if err := c.ensureWorkDirAllowed(session, isSuperAdmin); err != nil {
 		c.sendText(ctx, chatID, fmt.Sprintf("Error: %s", err))
 		return
 	}
 
-	wd := c.currentRunner().GetWorkDir(userID)
+	wd := c.currentRunner().GetWorkDir(session.Key, session.Persistent)
 	logDir := filepath.Join(wd, ".maple_bridge", "logs")
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		c.sendText(ctx, chatID, fmt.Sprintf("Create log dir failed: %s", err))
@@ -855,7 +894,7 @@ func resolveExistingDir(dir string) (string, error) {
 	return realPath, nil
 }
 
-func (c *Client) ensureWorkDirAllowed(userID string, isSuperAdmin bool) error {
+func (c *Client) ensureWorkDirAllowed(session sessionRef, isSuperAdmin bool) error {
 	if isSuperAdmin {
 		return nil
 	}
@@ -866,13 +905,13 @@ func (c *Client) ensureWorkDirAllowed(userID string, isSuperAdmin bool) error {
 	}
 
 	runner := c.currentRunner()
-	realCurrent, err := resolveExistingDir(runner.GetWorkDir(userID))
+	realCurrent, err := resolveExistingDir(runner.GetWorkDir(session.Key, session.Persistent))
 	if err != nil || !isPathWithin(realWorkspace, realCurrent) {
-		runner.SetWorkDir(userID, realWorkspace)
+		runner.SetWorkDir(session.Key, session.Persistent, realWorkspace)
 		return nil
 	}
-	if realCurrent != runner.GetWorkDir(userID) {
-		runner.SetWorkDir(userID, realCurrent)
+	if realCurrent != runner.GetWorkDir(session.Key, session.Persistent) {
+		runner.SetWorkDir(session.Key, session.Persistent, realCurrent)
 	}
 	return nil
 }

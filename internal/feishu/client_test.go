@@ -10,6 +10,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
+
 	"gitee.com/maple_wsy/maple_bridge/internal/codex"
 	"gitee.com/maple_wsy/maple_bridge/internal/config"
 )
@@ -20,13 +22,14 @@ func TestChangeWorkDirRestrictsNonSuperAdminToWorkspace(t *testing.T) {
 	workspace := t.TempDir()
 	outside := t.TempDir()
 	client := testClient(t, workspace)
+	session := testSession()
 
-	msg := client.changeWorkDir("ou_test", outside, false)
+	msg := client.changeWorkDir(session, outside, false)
 	if !strings.Contains(msg, "Permission denied") {
 		t.Fatalf("expected permission denial, got %q", msg)
 	}
 
-	if got := client.currentRunner().GetWorkDir("ou_test"); got != workspace {
+	if got := client.currentRunner().GetWorkDir(session.Key, session.Persistent); got != workspace {
 		t.Fatalf("expected workdir to remain %q, got %q", workspace, got)
 	}
 }
@@ -37,8 +40,9 @@ func TestChangeWorkDirAllowsSuperAdminOutsideWorkspace(t *testing.T) {
 	workspace := t.TempDir()
 	outside := t.TempDir()
 	client := testClient(t, workspace)
+	session := testSession()
 
-	msg := client.changeWorkDir("ou_test", outside, true)
+	msg := client.changeWorkDir(session, outside, true)
 	if !strings.Contains(msg, "Working directory changed") {
 		t.Fatalf("expected successful cd, got %q", msg)
 	}
@@ -47,7 +51,7 @@ func TestChangeWorkDirAllowsSuperAdminOutsideWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve outside dir: %v", err)
 	}
-	if got := client.currentRunner().GetWorkDir("ou_test"); got != realOutside {
+	if got := client.currentRunner().GetWorkDir(session.Key, session.Persistent); got != realOutside {
 		t.Fatalf("expected workdir %q, got %q", realOutside, got)
 	}
 }
@@ -62,8 +66,9 @@ func TestChangeWorkDirRejectsSymlinkEscapeForNonSuperAdmin(t *testing.T) {
 		t.Skipf("symlink not available: %v", err)
 	}
 	client := testClient(t, workspace)
+	session := testSession()
 
-	msg := client.changeWorkDir("ou_test", link, false)
+	msg := client.changeWorkDir(session, link, false)
 	if !strings.Contains(msg, "Permission denied") {
 		t.Fatalf("expected symlink escape denial, got %q", msg)
 	}
@@ -75,9 +80,10 @@ func TestEnsureWorkDirAllowedResetsNonSuperAdminOutsideWorkspace(t *testing.T) {
 	workspace := t.TempDir()
 	outside := t.TempDir()
 	client := testClient(t, workspace)
-	client.currentRunner().SetWorkDir("ou_test", outside)
+	session := testSession()
+	client.currentRunner().SetWorkDir(session.Key, session.Persistent, outside)
 
-	if err := client.ensureWorkDirAllowed("ou_test", false); err != nil {
+	if err := client.ensureWorkDirAllowed(session, false); err != nil {
 		t.Fatalf("ensure workdir: %v", err)
 	}
 
@@ -85,7 +91,7 @@ func TestEnsureWorkDirAllowedResetsNonSuperAdminOutsideWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve workspace: %v", err)
 	}
-	if got := client.currentRunner().GetWorkDir("ou_test"); got != realWorkspace {
+	if got := client.currentRunner().GetWorkDir(session.Key, session.Persistent); got != realWorkspace {
 		t.Fatalf("expected workdir %q, got %q", realWorkspace, got)
 	}
 }
@@ -216,6 +222,27 @@ func TestReplyUUIDIsStableUUIDShape(t *testing.T) {
 	}
 }
 
+func TestMessageSessionUsesChatForNonTopicMessages(t *testing.T) {
+	t.Parallel()
+
+	chatID := "oc_test"
+	session := messageSession(&larkim.EventMessage{ChatId: &chatID})
+	if session.Key != "chat:oc_test" || session.Persistent {
+		t.Fatalf("unexpected chat session: %#v", session)
+	}
+}
+
+func TestMessageSessionUsesPersistentTopicForRootMessages(t *testing.T) {
+	t.Parallel()
+
+	chatID := "oc_test"
+	rootID := "om_root"
+	session := messageSession(&larkim.EventMessage{ChatId: &chatID, RootId: &rootID})
+	if session.Key != "topic:oc_test:om_root" || !session.Persistent {
+		t.Fatalf("unexpected topic session: %#v", session)
+	}
+}
+
 func TestUserFacingErrorStripsCommandOutput(t *testing.T) {
 	t.Parallel()
 
@@ -249,4 +276,8 @@ func testClient(t *testing.T, workspace string) *Client {
 		},
 		runner: runner,
 	}
+}
+
+func testSession() sessionRef {
+	return sessionRef{Key: "chat:oc_test", Label: "chat oc_test"}
 }

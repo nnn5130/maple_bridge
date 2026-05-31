@@ -42,7 +42,7 @@ func Load(path string) (*Config, error) {
 	cfg := &Config{
 		LogLevel: "info",
 		Session: SessionConfig{
-			MaxIdleMinutes: 60,
+			MaxIdleMinutes: 30,
 		},
 		Codex: CodexConfig{
 			Path: "codex",

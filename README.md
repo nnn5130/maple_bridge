@@ -62,10 +62,10 @@ make restart
 - `运行 go test ./... 看看测试结果`
 - `/help` — 查看内置命令
 - `/reload` — 重新读取配置（仅超级管理员）
-- `/reset` — 重置当前用户的运行状态
+- `/reset` — 重置当前 chat/话题的运行状态
 - `/workspace` — 查看配置的 workspace 根目录
-- `/ll` — 查看当前用户的当前工作目录
-- `/cd <dir>` — 切换当前用户的工作目录；super-admin 可访问全部目录，其他用户限制在 `working_dir` 内
+- `/ll` — 查看当前 chat/话题的当前工作目录
+- `/cd <dir>` — 切换当前 chat/话题的工作目录；super-admin 可访问全部目录，其他用户限制在 `working_dir` 内
 - `/status` — 查看当前会话和工作目录
 - `/run <command>` — 在当前工作目录执行一次性命令，最多运行 30 秒（仅管理员）
 - `/start <command>` — 后台启动服务（仅管理员），日志写入 `.maple_bridge/logs/`
@@ -84,7 +84,7 @@ make restart
 
 ## 特性
 
-- 用户状态：同一用户保留 30 分钟上下文、工作目录和轮次状态
+- Chat 状态：普通 chat 保留 30 分钟状态，prompt 只带最近 20 条用户消息；话题内 session 持久化保存到 `.maple_bridge/topic_sessions/`
 - 长消息分段：超长输出自动拆分为多条飞书消息
 - 用户白名单：默认要求显式配置允许访问的飞书用户
 - 后台服务：管理员可用 `/start` 启动长期运行的服务，并通过 `/services`、`/pid`、`/logs`、`/stop` 管理

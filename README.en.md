@@ -51,10 +51,10 @@ make restart
 
 - `/help`: show command help
 - `/reload`: reload config from disk, super-admin only
-- `/reset`: clear your Codex context
+- `/reset`: clear the current chat/topic Codex context
 - `/workspace`: list the configured workspace root
-- `/ll`: list your current working directory
-- `/cd <dir>`: switch directory; super-admin can access all directories, other users stay inside `working_dir`
+- `/ll`: list the current chat/topic working directory
+- `/cd <dir>`: switch the current chat/topic directory; super-admin can access all directories, other users stay inside `working_dir`
 - `/status`: show session status
 - `/run <command>`: run a one-shot shell command, admin only
 - `/start <command>`: start a managed background service, admin only

@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -38,11 +39,41 @@ func TestTrimHistoryKeepsNewestMessages(t *testing.T) {
 	}
 }
 
+func TestRecordTurnKeepsOnlyUserMessagesForSharedChat(t *testing.T) {
+	t.Parallel()
+
+	info := &sessionInfo{}
+	for i := 0; i < maxHistoryMessages+5; i++ {
+		info.recordTurn("user message", strings.Repeat("assistant output", 100), false)
+	}
+	if len(info.history) != maxHistoryMessages {
+		t.Fatalf("expected %d history messages, got %d", maxHistoryMessages, len(info.history))
+	}
+	for _, msg := range info.history {
+		if msg.Role != "user" {
+			t.Fatalf("expected only user messages in shared chat history, got %#v", info.history)
+		}
+	}
+}
+
+func TestRecordTurnKeepsAssistantMessagesForPersistentTopics(t *testing.T) {
+	t.Parallel()
+
+	info := &sessionInfo{}
+	info.recordTurn("user message", "assistant output", true)
+	if len(info.history) != 2 {
+		t.Fatalf("expected user and assistant messages, got %#v", info.history)
+	}
+	if info.history[0].Role != "user" || info.history[1].Role != "assistant" {
+		t.Fatalf("unexpected persistent topic history: %#v", info.history)
+	}
+}
+
 func TestPromptIncludesBridgeImageGenerationConstraintWithoutHistory(t *testing.T) {
 	t.Parallel()
 
 	info := &sessionInfo{}
-	got := info.promptWithHistory("画一张图", 30)
+	got := info.promptWithHistory("画一张图", 30, false)
 	if !strings.Contains(got, "Do not use the built-in image_gen tool") {
 		t.Fatalf("expected image_gen constraint, got %q", got)
 	}
@@ -60,12 +91,49 @@ func TestPromptIncludesBridgeImageGenerationConstraintWithHistory(t *testing.T) 
 	info := &sessionInfo{
 		history: []historyMessage{{Role: "assistant", Content: "old answer"}},
 	}
-	got := info.promptWithHistory("latest", 30)
+	got := info.promptWithHistory("latest", 30, false)
 	if !strings.Contains(got, "Do not use the built-in image_gen tool") {
 		t.Fatalf("expected image_gen constraint, got %q", got)
 	}
 	if !strings.Contains(got, "<conversation_context>") || !strings.Contains(got, "<latest_user_request>") {
 		t.Fatalf("expected history prompt structure, got %q", got)
+	}
+}
+
+func TestPersistentSessionRestoresWorkDir(t *testing.T) {
+	t.Parallel()
+
+	workspace := t.TempDir()
+	other := t.TempDir()
+	key := "topic:oc_test:om_root"
+
+	runner := NewRunner("codex", workspace, 30)
+	runner.SetWorkDir(key, true, other)
+	runner.Close()
+
+	restored := NewRunner("codex", workspace, 30)
+	t.Cleanup(restored.Close)
+	if got := restored.GetWorkDir(key, true); got != other {
+		t.Fatalf("expected persisted workdir %q, got %q", other, got)
+	}
+}
+
+func TestPersistentSessionResetRemovesStoredState(t *testing.T) {
+	t.Parallel()
+
+	workspace := t.TempDir()
+	other := t.TempDir()
+	key := "topic:oc_test:om_root"
+
+	runner := NewRunner("codex", workspace, 30)
+	t.Cleanup(runner.Close)
+	runner.SetWorkDir(key, true, other)
+	if _, err := os.Stat(runner.sessionPath(key)); err != nil {
+		t.Fatalf("expected session file: %v", err)
+	}
+	runner.Reset(key, true)
+	if _, err := os.Stat(runner.sessionPath(key)); !os.IsNotExist(err) {
+		t.Fatalf("expected session file to be removed, got %v", err)
 	}
 }
 

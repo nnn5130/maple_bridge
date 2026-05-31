@@ -3,6 +3,9 @@ package codex
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -18,7 +21,7 @@ const (
 	commandOutputLimit     = 64 * 1024
 	commandErrorLimit      = 4000
 	maxHistoryMessages     = 20
-	maxHistoryContentBytes = 32 * 1024
+	maxHistoryContentBytes = 8 * 1024
 )
 
 const bridgeInstructions = `Bridge runtime constraints:
@@ -35,8 +38,9 @@ type Result struct {
 type Runner struct {
 	codexPath string
 	workDir   string
+	storeDir  string
 
-	mu       sync.Map // map[string]*sessionInfo
+	mu       sync.Map // map[string]*sessionInfo, keyed by chat/topic session key.
 	maxIdle  time.Duration
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -47,7 +51,7 @@ type sessionInfo struct {
 	turns    int
 	workDir  string
 	history  []historyMessage
-	mu       sync.Mutex
+	mu       sync.Mutex `json:"-"`
 }
 
 type historyMessage struct {
@@ -56,10 +60,18 @@ type historyMessage struct {
 	CreatedAt time.Time
 }
 
+type persistedSession struct {
+	LastUsed time.Time        `json:"last_used"`
+	Turns    int              `json:"turns"`
+	WorkDir  string           `json:"work_dir,omitempty"`
+	History  []historyMessage `json:"history,omitempty"`
+}
+
 func NewRunner(codexPath, workDir string, maxIdleMin int) *Runner {
 	r := &Runner{
 		codexPath: codexPath,
 		workDir:   workDir,
+		storeDir:  filepath.Join(workDir, ".maple_bridge", "topic_sessions"),
 		maxIdle:   time.Duration(maxIdleMin) * time.Minute,
 		stop:      make(chan struct{}),
 	}
@@ -75,18 +87,20 @@ func (r *Runner) Close() {
 }
 
 // Run executes Codex CLI non-interactively for a single Feishu message.
-func (r *Runner) Run(ctx context.Context, userID, message string, isAdmin bool) (*Result, error) {
-	info := r.getOrCreate(userID)
+func (r *Runner) Run(ctx context.Context, sessionKey string, persistent bool, message string, isAdmin bool) (*Result, error) {
+	info := r.getOrCreate(sessionKey, persistent)
 	info.mu.Lock()
 	defer info.mu.Unlock()
 	info.touch()
-	info.pruneHistory(r.maxIdle)
+	if !persistent {
+		info.pruneHistory(r.maxIdle)
+	}
 
 	wd := info.workDir
 	if wd == "" {
 		wd = r.workDir
 	}
-	prompt := info.promptWithHistory(message, r.maxIdle)
+	prompt := info.promptWithHistory(message, r.maxIdle, persistent)
 
 	outputFile, err := os.CreateTemp("", "maple-bridge-codex-*.txt")
 	if err != nil {
@@ -130,23 +144,29 @@ func (r *Runner) Run(ctx context.Context, userID, message string, isAdmin bool) 
 		return nil, fmt.Errorf("read codex output: %w", err)
 	}
 	info.turns++
-	info.history = append(info.history,
-		historyMessage{Role: "user", Content: limitHistoryContent(message), CreatedAt: time.Now()},
-		historyMessage{Role: "assistant", Content: limitHistoryContent(string(output)), CreatedAt: time.Now()},
-	)
-	info.trimHistory(maxHistoryMessages)
+	info.recordTurn(message, string(output), persistent)
 	info.touch()
+	if persistent {
+		if err := r.saveSessionLocked(sessionKey, info); err != nil {
+			slog.Warn("save persistent session", "session_key", sessionKey, "error", err)
+		}
+	}
 
 	return &Result{Text: string(output)}, nil
 }
 
-func (r *Runner) Reset(userID string) {
-	r.mu.Delete(userID)
+func (r *Runner) Reset(sessionKey string, persistent bool) {
+	r.mu.Delete(sessionKey)
+	if persistent {
+		if err := os.Remove(r.sessionPath(sessionKey)); err != nil && !os.IsNotExist(err) {
+			slog.Warn("remove persistent session", "session_key", sessionKey, "error", err)
+		}
+	}
 }
 
-// SessionInfo returns the current per-user runner state.
-func (r *Runner) SessionInfo(userID string) (sessionID, workDir string, turns int) {
-	info := r.getOrCreate(userID)
+// SessionInfo returns the current chat/topic runner state.
+func (r *Runner) SessionInfo(sessionKey string, persistent bool) (sessionID, workDir string, turns int) {
+	info := r.getOrCreate(sessionKey, persistent)
 	info.mu.Lock()
 	defer info.mu.Unlock()
 	info.touch()
@@ -154,22 +174,32 @@ func (r *Runner) SessionInfo(userID string) (sessionID, workDir string, turns in
 	if wd == "" {
 		wd = r.workDir
 	}
-	info.pruneHistory(r.maxIdle)
-	return fmt.Sprintf("codex exec with %d-minute bridge context (%d messages)", int(r.maxIdle.Minutes()), len(info.history)), wd, info.turns
+	if !persistent {
+		info.pruneHistory(r.maxIdle)
+	}
+	if persistent {
+		return fmt.Sprintf("persistent topic context (%d messages)", len(info.history)), wd, info.turns
+	}
+	return fmt.Sprintf("codex exec with %d-minute chat context (%d messages)", int(r.maxIdle.Minutes()), len(info.history)), wd, info.turns
 }
 
-// SetWorkDir updates the working directory for a user's session.
-func (r *Runner) SetWorkDir(userID, dir string) {
-	info := r.getOrCreate(userID)
+// SetWorkDir updates the working directory for a chat/topic session.
+func (r *Runner) SetWorkDir(sessionKey string, persistent bool, dir string) {
+	info := r.getOrCreate(sessionKey, persistent)
 	info.mu.Lock()
 	defer info.mu.Unlock()
 	info.touch()
 	info.workDir = filepath.Clean(dir)
+	if persistent {
+		if err := r.saveSessionLocked(sessionKey, info); err != nil {
+			slog.Warn("save persistent session workdir", "session_key", sessionKey, "error", err)
+		}
+	}
 }
 
-// GetWorkDir returns the effective working directory for a user.
-func (r *Runner) GetWorkDir(userID string) string {
-	info := r.getOrCreate(userID)
+// GetWorkDir returns the effective working directory for a chat/topic session.
+func (r *Runner) GetWorkDir(sessionKey string, persistent bool) string {
+	info := r.getOrCreate(sessionKey, persistent)
 	info.mu.Lock()
 	defer info.mu.Unlock()
 	info.touch()
@@ -179,13 +209,23 @@ func (r *Runner) GetWorkDir(userID string) string {
 	return r.workDir
 }
 
-func (r *Runner) getOrCreate(userID string) *sessionInfo {
-	val, ok := r.mu.Load(userID)
+func (r *Runner) getOrCreate(sessionKey string, persistent bool) *sessionInfo {
+	val, ok := r.mu.Load(sessionKey)
 	if ok {
 		return val.(*sessionInfo)
 	}
 	info := &sessionInfo{lastUsed: time.Now()}
-	actual, _ := r.mu.LoadOrStore(userID, info)
+	if persistent {
+		if loaded, err := r.loadSession(sessionKey); err == nil {
+			info = loaded
+		} else if !os.IsNotExist(err) {
+			slog.Warn("load persistent session", "session_key", sessionKey, "error", err)
+		}
+		if info.lastUsed.IsZero() {
+			info.lastUsed = time.Now()
+		}
+	}
+	actual, _ := r.mu.LoadOrStore(sessionKey, info)
 	return actual.(*sessionInfo)
 }
 
@@ -210,7 +250,16 @@ func (s *sessionInfo) trimHistory(maxMessages int) {
 	}
 }
 
-func (s *sessionInfo) promptWithHistory(message string, maxAge time.Duration) string {
+func (s *sessionInfo) recordTurn(message, output string, persistent bool) {
+	now := time.Now()
+	s.history = append(s.history, historyMessage{Role: "user", Content: limitHistoryContent(message), CreatedAt: now})
+	if persistent {
+		s.history = append(s.history, historyMessage{Role: "assistant", Content: limitHistoryContent(output), CreatedAt: now})
+	}
+	s.trimHistory(maxHistoryMessages)
+}
+
+func (s *sessionInfo) promptWithHistory(message string, maxAge time.Duration, persistent bool) string {
 	var b strings.Builder
 	b.WriteString(bridgeInstructions)
 	b.WriteString("\n")
@@ -220,7 +269,11 @@ func (s *sessionInfo) promptWithHistory(message string, maxAge time.Duration) st
 		return b.String()
 	}
 
-	fmt.Fprintf(&b, "You are continuing a Feishu-controlled Codex conversation. The following context contains messages from the last %d minutes. Use it as conversation history, but prioritize the latest user request.\n\n", int(maxAge.Minutes()))
+	if persistent {
+		b.WriteString("You are continuing a persistent Feishu topic Codex conversation. Use the following context as shared topic history visible to everyone in the topic, but prioritize the latest user request.\n\n")
+	} else {
+		fmt.Fprintf(&b, "You are continuing a Feishu-controlled Codex chat conversation. The following context contains messages from the last %d minutes and is shared by the chat. Use it as conversation history, but prioritize the latest user request.\n\n", int(maxAge.Minutes()))
+	}
 	b.WriteString("<conversation_context>\n")
 	for _, msg := range s.history {
 		fmt.Fprintf(&b, "%s: %s\n\n", msg.Role, msg.Content)
@@ -230,6 +283,46 @@ func (s *sessionInfo) promptWithHistory(message string, maxAge time.Duration) st
 	b.WriteString(message)
 	b.WriteString("\n</latest_user_request>")
 	return b.String()
+}
+
+func (r *Runner) loadSession(sessionKey string) (*sessionInfo, error) {
+	data, err := os.ReadFile(r.sessionPath(sessionKey))
+	if err != nil {
+		return nil, err
+	}
+	var info sessionInfo
+	var persisted persistedSession
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		return nil, err
+	}
+	info.lastUsed = persisted.LastUsed
+	info.turns = persisted.Turns
+	info.workDir = persisted.WorkDir
+	info.history = persisted.History
+	info.trimHistory(maxHistoryMessages)
+	return &info, nil
+}
+
+func (r *Runner) saveSessionLocked(sessionKey string, info *sessionInfo) error {
+	if err := os.MkdirAll(r.storeDir, 0o755); err != nil {
+		return err
+	}
+	persisted := persistedSession{
+		LastUsed: info.lastUsed,
+		Turns:    info.turns,
+		WorkDir:  info.workDir,
+		History:  info.history,
+	}
+	data, err := json.MarshalIndent(persisted, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(r.sessionPath(sessionKey), data, 0o600)
+}
+
+func (r *Runner) sessionPath(sessionKey string) string {
+	sum := sha256.Sum256([]byte(sessionKey))
+	return filepath.Join(r.storeDir, hex.EncodeToString(sum[:])+".json")
 }
 
 type limitedBuffer struct {
@@ -309,8 +402,9 @@ func (r *Runner) cleanup() {
 			info.mu.Lock()
 			expired := now.Sub(info.lastUsed) > r.maxIdle
 			info.mu.Unlock()
-			if expired {
-				slog.Info("session expired", "user_id", key)
+			sessionKey, _ := key.(string)
+			if expired && !strings.HasPrefix(sessionKey, "topic:") {
+				slog.Info("session expired", "session_key", key)
 				r.mu.Delete(key)
 			}
 			return true
