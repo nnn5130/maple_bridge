@@ -36,6 +36,7 @@ You can also run the skill CLI directly:
 
 ```bash
 ~/.codex/skills/maple-bridge/scripts/maple_bridge.sh install
+~/.codex/skills/maple-bridge/scripts/maple_bridge.sh configure
 ~/.codex/skills/maple-bridge/scripts/maple_bridge.sh doctor
 ~/.codex/skills/maple-bridge/scripts/maple_bridge.sh restart
 ```
@@ -56,6 +57,12 @@ Edit `configs/config.yaml`:
 - `allowed_users`: Feishu/Lark user open IDs allowed to use the bot
 - `admin_users`: users allowed to run shell commands and manage services
 - `super_admin_users`: users allowed to manage all services and `cd` outside the workspace
+
+Or run the guided configurator:
+
+```bash
+~/.codex/skills/maple-bridge/scripts/maple_bridge.sh configure
+```
 
 ### Run
 

@@ -36,6 +36,7 @@ curl -fsSL https://raw.githubusercontent.com/nnn5130/maple_bridge/master/scripts
 
 ```bash
 ~/.codex/skills/maple-bridge/scripts/maple_bridge.sh install
+~/.codex/skills/maple-bridge/scripts/maple_bridge.sh configure
 ~/.codex/skills/maple-bridge/scripts/maple_bridge.sh doctor
 ~/.codex/skills/maple-bridge/scripts/maple_bridge.sh restart
 ```
@@ -55,6 +56,12 @@ cp configs/config.example.yaml configs/config.yaml
 - `allowed_users` — 允许使用的用户 open_id，`allow_all_users=false` 时必须配置
 - `admin_users` — 管理员用户 open_id，可使用 shell 和后台服务命令
 - `super_admin_users` — 超级管理员 open_id，可管理所有后台服务，且 `/cd` 可访问全部目录
+
+也可以运行配置向导：
+
+```bash
+~/.codex/skills/maple-bridge/scripts/maple_bridge.sh configure
+```
 
 ### 4. 构建 & 运行
 

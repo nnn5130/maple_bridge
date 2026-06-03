@@ -22,6 +22,7 @@ If the skill is installed somewhere else, resolve the script relative to this `S
 ## Commands
 
 - `install`: clone or update the repo into `$MAPLE_BRIDGE_HOME` or `~/.local/share/maple_bridge`, build the Go binary, and create `configs/config.yaml` from the example if missing.
+- `configure`: interactively collect Feishu app credentials, Codex path, workspace path, and user allowlists, then write `configs/config.yaml`.
 - `doctor`: verify `git`, `go`, `codex`, repo, config, binary, and launchd process state.
 - `build`: build `bin/maple_bridge`.
 - `run`: foreground run with `configs/config.yaml`.
@@ -35,7 +36,7 @@ If the skill is installed somewhere else, resolve the script relative to this `S
 
 1. Run `maple_bridge.sh doctor` first when diagnosing an existing installation.
 2. Run `maple_bridge.sh install` for a new machine or to update/build the local checkout.
-3. Ensure `configs/config.yaml` contains:
+3. Run `maple_bridge.sh configure` to write `configs/config.yaml`. It prompts for:
    - `feishu.app_id`
    - `feishu.app_secret`
    - `codex.path`
