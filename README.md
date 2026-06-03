@@ -18,7 +18,31 @@
 - Codex CLI 已安装并登录（`codex` 命令可用）
 - 飞书自建应用（启用机器人能力，事件订阅选「长连接」模式）
 
-### 2. 配置
+### 2. 一键安装 Codex Skill
+
+如果你想让 AI 直接帮你安装、更新、启动和排障 `maple_bridge`，先安装内置 skill：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nnn5130/maple_bridge/master/scripts/install-codex-skill.sh | bash
+```
+
+重启 Codex 后，可以直接说：
+
+```text
+使用 $maple-bridge 安装并启动 bridge
+```
+
+也可以手动调用 skill CLI：
+
+```bash
+~/.codex/skills/maple-bridge/scripts/maple_bridge.sh install
+~/.codex/skills/maple-bridge/scripts/maple_bridge.sh doctor
+~/.codex/skills/maple-bridge/scripts/maple_bridge.sh restart
+```
+
+默认会把项目安装到 `~/.local/share/maple_bridge`。可通过 `MAPLE_BRIDGE_HOME=/path/to/maple_bridge` 覆盖。
+
+### 3. 配置
 
 ```bash
 cp configs/config.example.yaml configs/config.yaml
@@ -32,7 +56,7 @@ cp configs/config.example.yaml configs/config.yaml
 - `admin_users` — 管理员用户 open_id，可使用 shell 和后台服务命令
 - `super_admin_users` — 超级管理员 open_id，可管理所有后台服务，且 `/cd` 可访问全部目录
 
-### 3. 构建 & 运行
+### 4. 构建 & 运行
 
 本地前台运行：
 
@@ -46,7 +70,7 @@ macOS LaunchAgent 后台重启：
 make restart
 ```
 
-### 4. 飞书配置
+### 5. 飞书配置
 
 在飞书开发者后台：
 1. 创建自建应用，启用「机器人」能力
@@ -101,6 +125,7 @@ internal/
   feishu/client.go                 # 飞书 WebSocket + 消息处理
   codex/runner.go                  # Codex CLI 调用 + 用户状态管理
 configs/config.example.yaml
+skills/maple-bridge/               # Codex skill + AI 操作 CLI
 ```
 
 ## License

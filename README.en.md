@@ -18,6 +18,30 @@ The bridge reuses your local Codex CLI authentication and local filesystem acces
 - Codex CLI installed and logged in
 - A Feishu/Lark custom app with bot capability and WebSocket event subscription enabled
 
+### One-Click Codex Skill Install
+
+Install the Codex skill if you want an AI agent to install, update, run, and troubleshoot the bridge for you:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nnn5130/maple_bridge/master/scripts/install-codex-skill.sh | bash
+```
+
+Restart Codex, then ask:
+
+```text
+Use $maple-bridge to install and start the bridge.
+```
+
+You can also run the skill CLI directly:
+
+```bash
+~/.codex/skills/maple-bridge/scripts/maple_bridge.sh install
+~/.codex/skills/maple-bridge/scripts/maple_bridge.sh doctor
+~/.codex/skills/maple-bridge/scripts/maple_bridge.sh restart
+```
+
+The default project checkout is `~/.local/share/maple_bridge`. Override it with `MAPLE_BRIDGE_HOME=/path/to/maple_bridge`.
+
 ### Configure
 
 ```bash

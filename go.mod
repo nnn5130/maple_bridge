@@ -1,4 +1,4 @@
-module gitee.com/maple_wsy/maple_bridge
+module github.com/nnn5130/maple_bridge
 
 go 1.22.0
 

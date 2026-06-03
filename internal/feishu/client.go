@@ -24,8 +24,8 @@ import (
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
-	"gitee.com/maple_wsy/maple_bridge/internal/codex"
-	"gitee.com/maple_wsy/maple_bridge/internal/config"
+	"github.com/nnn5130/maple_bridge/internal/codex"
+	"github.com/nnn5130/maple_bridge/internal/config"
 )
 
 type Client struct {

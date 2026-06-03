@@ -1,0 +1,5 @@
+interface:
+  display_name: "maple_bridge"
+  short_description: "Install and operate the Feishu-to-Codex bridge"
+  brand_color: "#2563EB"
+  default_prompt: "Use $maple-bridge to install, configure, or troubleshoot my maple_bridge Feishu-to-Codex service."
