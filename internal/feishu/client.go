@@ -61,13 +61,16 @@ const (
 )
 
 type managedProcess struct {
-	PID         int
-	OwnerUserID string
-	OwnerName   string
-	Command     string
-	WorkDir     string
-	LogPath     string
-	StartedAt   time.Time
+	PID              int
+	OwnerUserID      string
+	OwnerName        string
+	Command          string
+	WorkDir          string
+	LogPath          string
+	StartedAt        time.Time
+	ProcessStartedAt string `json:"process_started_at,omitempty"`
+	ProcessGroupID   int    `json:"process_group_id,omitempty"`
+	ProcessCommand   string `json:"process_command,omitempty"`
 }
 
 type sessionRef struct {
@@ -549,15 +552,22 @@ func (c *Client) startService(session sessionRef, userID, chatID, command string
 		c.sendText(ctx, chatID, fmt.Sprintf("Start failed: %s", err))
 		return
 	}
+	identity, identityErr := lookupProcessIdentity(cmd.Process.Pid)
+	if identityErr != nil {
+		slog.Warn("lookup managed service identity", "pid", cmd.Process.Pid, "error", identityErr)
+	}
 
 	proc := &managedProcess{
-		PID:         cmd.Process.Pid,
-		OwnerUserID: userID,
-		OwnerName:   c.displayName(c.currentConfig(), userID),
-		Command:     command,
-		WorkDir:     wd,
-		LogPath:     logPath,
-		StartedAt:   time.Now(),
+		PID:              cmd.Process.Pid,
+		OwnerUserID:      userID,
+		OwnerName:        c.displayName(c.currentConfig(), userID),
+		Command:          command,
+		WorkDir:          wd,
+		LogPath:          logPath,
+		StartedAt:        time.Now(),
+		ProcessStartedAt: identity.StartedAt,
+		ProcessGroupID:   identity.GroupID,
+		ProcessCommand:   identity.Command,
 	}
 	c.procMu.Lock()
 	c.procs[proc.PID] = proc
@@ -723,6 +733,7 @@ func (c *Client) restoreManagedServicesFromListLocked(procs []*managedProcess) {
 		if proc.OwnerName == "" {
 			proc.OwnerName = c.displayName(c.currentConfig(), proc.OwnerUserID)
 		}
+		enrichManagedProcessIdentity(proc)
 		c.procs[proc.PID] = proc
 	}
 }
@@ -774,19 +785,95 @@ func managedProcessAlive(proc *managedProcess) bool {
 	if proc == nil || !processAlive(proc.PID) {
 		return false
 	}
-	return processCommandMatches(proc.PID, proc.Command)
-}
-
-func processCommandMatches(pid int, command string) bool {
-	command = strings.TrimSpace(command)
-	if command == "" {
-		return false
-	}
-	output, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	identity, err := lookupProcessIdentity(proc.PID)
 	if err != nil {
 		return false
 	}
-	return strings.Contains(strings.TrimSpace(string(output)), command)
+	return managedProcessIdentityMatches(proc, identity)
+}
+
+type processIdentity struct {
+	StartedAt string
+	GroupID   int
+	Command   string
+}
+
+func enrichManagedProcessIdentity(proc *managedProcess) {
+	if proc == nil {
+		return
+	}
+	if proc.ProcessStartedAt != "" && proc.ProcessGroupID > 0 && proc.ProcessCommand != "" {
+		return
+	}
+	identity, err := lookupProcessIdentity(proc.PID)
+	if err != nil {
+		return
+	}
+	proc.ProcessStartedAt = identity.StartedAt
+	proc.ProcessGroupID = identity.GroupID
+	proc.ProcessCommand = identity.Command
+}
+
+func managedProcessIdentityMatches(proc *managedProcess, identity processIdentity) bool {
+	hasStrongIdentity := false
+	if proc.ProcessStartedAt != "" && identity.StartedAt != proc.ProcessStartedAt {
+		return false
+	} else if proc.ProcessStartedAt != "" {
+		hasStrongIdentity = true
+	}
+	if proc.ProcessGroupID > 0 && identity.GroupID != proc.ProcessGroupID {
+		return false
+	} else if proc.ProcessGroupID > 0 {
+		hasStrongIdentity = true
+	}
+	if hasStrongIdentity {
+		return true
+	}
+	actualCommand := strings.TrimSpace(identity.Command)
+	if proc.ProcessCommand != "" {
+		return actualCommand == strings.TrimSpace(proc.ProcessCommand)
+	}
+	return processCommandMatches(actualCommand, proc.Command)
+}
+
+func lookupProcessIdentity(pid int) (processIdentity, error) {
+	startedAt, err := readProcessField(pid, "lstart")
+	if err != nil {
+		return processIdentity{}, err
+	}
+	groupIDText, err := readProcessField(pid, "pgid")
+	if err != nil {
+		return processIdentity{}, err
+	}
+	groupID, err := strconv.Atoi(strings.TrimSpace(groupIDText))
+	if err != nil {
+		return processIdentity{}, fmt.Errorf("parse process group id %q: %w", groupIDText, err)
+	}
+	command, err := readProcessField(pid, "command")
+	if err != nil {
+		return processIdentity{}, err
+	}
+	return processIdentity{
+		StartedAt: strings.TrimSpace(startedAt),
+		GroupID:   groupID,
+		Command:   strings.TrimSpace(command),
+	}, nil
+}
+
+var readProcessField = func(pid int, field string) (string, error) {
+	output, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", field+"=").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func processCommandMatches(actual, expected string) bool {
+	expected = strings.TrimSpace(expected)
+	if expected == "" {
+		return false
+	}
+	return strings.Contains(strings.TrimSpace(actual), expected)
 }
 
 func (c *Client) reloadConfig() string {
@@ -1229,16 +1316,17 @@ func newLimitedBuffer(limit int) *limitedBuffer {
 }
 
 func (b *limitedBuffer) Write(p []byte) (int, error) {
-	b.total += len(p)
+	n := len(p)
+	b.total += n
 	if b.limit <= 0 || b.buf.Len() >= b.limit {
-		return len(p), nil
+		return n, nil
 	}
 	remaining := b.limit - b.buf.Len()
 	if len(p) > remaining {
 		p = p[:remaining]
 	}
 	_, _ = b.buf.Write(p)
-	return len(p), nil
+	return n, nil
 }
 
 func (b *limitedBuffer) Len() int {

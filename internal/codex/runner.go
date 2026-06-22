@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -22,6 +23,7 @@ const (
 	commandErrorLimit      = 4000
 	maxHistoryMessages     = 20
 	maxHistoryContentBytes = 8 * 1024
+	defaultRunTimeout      = 30 * time.Minute
 )
 
 const bridgeInstructions = `Bridge runtime constraints:
@@ -37,9 +39,10 @@ type Result struct {
 }
 
 type Runner struct {
-	codexPath string
-	workDir   string
-	storeDir  string
+	codexPath  string
+	workDir    string
+	storeDir   string
+	runTimeout time.Duration
 
 	mu       sync.Map // map[string]*sessionInfo, keyed by chat/topic session key.
 	maxIdle  time.Duration
@@ -47,11 +50,20 @@ type Runner struct {
 	stopOnce sync.Once
 }
 
+type sessionStatus int
+
+const (
+	sessionStatusReset  sessionStatus = 0
+	sessionStatusActive sessionStatus = 1
+)
+
 type sessionInfo struct {
 	lastUsed time.Time
 	turns    int
 	workDir  string
 	history  []historyMessage
+	status   sessionStatus
+	runMu    sync.Mutex `json:"-"`
 	mu       sync.Mutex `json:"-"`
 }
 
@@ -70,11 +82,12 @@ type persistedSession struct {
 
 func NewRunner(codexPath, workDir string, maxIdleMin int) *Runner {
 	r := &Runner{
-		codexPath: codexPath,
-		workDir:   workDir,
-		storeDir:  filepath.Join(workDir, ".maple_bridge", "topic_sessions"),
-		maxIdle:   time.Duration(maxIdleMin) * time.Minute,
-		stop:      make(chan struct{}),
+		codexPath:  codexPath,
+		workDir:    workDir,
+		storeDir:   filepath.Join(workDir, ".maple_bridge", "topic_sessions"),
+		runTimeout: defaultRunTimeout,
+		maxIdle:    time.Duration(maxIdleMin) * time.Minute,
+		stop:       make(chan struct{}),
 	}
 	go r.cleanup()
 	return r
@@ -90,8 +103,14 @@ func (r *Runner) Close() {
 // Run executes Codex CLI non-interactively for a single Feishu message.
 func (r *Runner) Run(ctx context.Context, sessionKey string, persistent bool, message string, isAdmin bool) (*Result, error) {
 	info := r.getOrCreate(sessionKey, persistent)
+	info.runMu.Lock()
+	defer info.runMu.Unlock()
+
 	info.mu.Lock()
-	defer info.mu.Unlock()
+	if info.status != sessionStatusActive {
+		info.mu.Unlock()
+		return nil, fmt.Errorf("session was reset")
+	}
 	info.touch()
 	if !persistent {
 		info.pruneHistory(r.maxIdle)
@@ -102,6 +121,8 @@ func (r *Runner) Run(ctx context.Context, sessionKey string, persistent bool, me
 		wd = r.workDir
 	}
 	prompt := info.promptWithHistory(message, r.maxIdle, persistent)
+	historyLen := len(info.history)
+	info.mu.Unlock()
 
 	outputFile, err := os.CreateTemp("", "maple-bridge-codex-*.txt")
 	if err != nil {
@@ -125,9 +146,12 @@ func (r *Runner) Run(ctx context.Context, sessionKey string, persistent bool, me
 	}
 	args = append(args, "-")
 
-	slog.Info("running codex", "work_dir", wd, "message_len", len(message), "prompt_len", len(prompt), "history_messages", len(info.history), "admin", isAdmin)
+	slog.Info("running codex", "work_dir", wd, "message_len", len(message), "prompt_len", len(prompt), "history_messages", historyLen, "admin", isAdmin, "timeout", r.runTimeout.String())
 
-	cmd := exec.CommandContext(ctx, r.codexPath, args...)
+	runCtx, cancel := context.WithTimeout(ctx, r.runTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(runCtx, r.codexPath, args...)
 	cmd.Dir = wd
 	cmd.Stdin = strings.NewReader(prompt)
 
@@ -137,12 +161,21 @@ func (r *Runner) Run(ctx context.Context, sessionKey string, persistent bool, me
 	cmd.Stderr = stderr
 
 	if err := cmd.Run(); err != nil {
+		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("codex timed out after %s", r.runTimeout.Round(time.Second))
+		}
 		return nil, codexFailureError(err, stderr.String(), stdout.String())
 	}
 
 	output, err := os.ReadFile(outputPath)
 	if err != nil {
 		return nil, fmt.Errorf("read codex output: %w", err)
+	}
+
+	info.mu.Lock()
+	defer info.mu.Unlock()
+	if info.status != sessionStatusActive {
+		return &Result{Text: string(output)}, nil
 	}
 	info.turns++
 	info.recordTurn(message, string(output), persistent)
@@ -157,7 +190,16 @@ func (r *Runner) Run(ctx context.Context, sessionKey string, persistent bool, me
 }
 
 func (r *Runner) Reset(sessionKey string, persistent bool) {
-	r.mu.Delete(sessionKey)
+	if val, ok := r.mu.Load(sessionKey); ok {
+		info := val.(*sessionInfo)
+		info.mu.Lock()
+		info.status = sessionStatusReset
+		info.turns = 0
+		info.workDir = ""
+		info.history = nil
+		info.touch()
+		info.mu.Unlock()
+	}
 	if persistent {
 		if err := os.Remove(r.sessionPath(sessionKey)); err != nil && !os.IsNotExist(err) {
 			slog.Warn("remove persistent session", "session_key", sessionKey, "error", err)
@@ -211,14 +253,37 @@ func (r *Runner) GetWorkDir(sessionKey string, persistent bool) string {
 }
 
 func (r *Runner) getOrCreate(sessionKey string, persistent bool) *sessionInfo {
-	val, ok := r.mu.Load(sessionKey)
-	if ok {
-		return val.(*sessionInfo)
+	for {
+		val, ok := r.mu.Load(sessionKey)
+		if ok {
+			info := val.(*sessionInfo)
+			info.mu.Lock()
+			reset := info.status == sessionStatusReset
+			info.mu.Unlock()
+			if !reset {
+				return info
+			}
+			fresh := r.newSessionInfo(sessionKey, persistent)
+			if r.mu.CompareAndSwap(sessionKey, info, fresh) {
+				return fresh
+			}
+			continue
+		}
+		info := r.newSessionInfo(sessionKey, persistent)
+		actual, loaded := r.mu.LoadOrStore(sessionKey, info)
+		if !loaded {
+			return info
+		}
+		return actual.(*sessionInfo)
 	}
-	info := &sessionInfo{lastUsed: time.Now()}
+}
+
+func (r *Runner) newSessionInfo(sessionKey string, persistent bool) *sessionInfo {
+	info := &sessionInfo{lastUsed: time.Now(), status: sessionStatusActive}
 	if persistent {
 		if loaded, err := r.loadSession(sessionKey); err == nil {
 			info = loaded
+			info.status = sessionStatusActive
 		} else if !os.IsNotExist(err) {
 			slog.Warn("load persistent session", "session_key", sessionKey, "error", err)
 		}
@@ -226,8 +291,7 @@ func (r *Runner) getOrCreate(sessionKey string, persistent bool) *sessionInfo {
 			info.lastUsed = time.Now()
 		}
 	}
-	actual, _ := r.mu.LoadOrStore(sessionKey, info)
-	return actual.(*sessionInfo)
+	return info
 }
 
 func (s *sessionInfo) touch() {
@@ -337,16 +401,17 @@ func newLimitedBuffer(limit int) *limitedBuffer {
 }
 
 func (b *limitedBuffer) Write(p []byte) (int, error) {
-	b.total += len(p)
+	n := len(p)
+	b.total += n
 	if b.limit <= 0 || b.buf.Len() >= b.limit {
-		return len(p), nil
+		return n, nil
 	}
 	remaining := b.limit - b.buf.Len()
 	if len(p) > remaining {
 		p = p[:remaining]
 	}
 	_, _ = b.buf.Write(p)
-	return len(p), nil
+	return n, nil
 }
 
 func (b *limitedBuffer) String() string {
@@ -397,18 +462,26 @@ func (r *Runner) cleanup() {
 		case <-r.stop:
 			return
 		}
-		now := time.Now()
-		r.mu.Range(func(key, value any) bool {
-			info := value.(*sessionInfo)
-			info.mu.Lock()
-			expired := now.Sub(info.lastUsed) > r.maxIdle
-			info.mu.Unlock()
-			sessionKey, _ := key.(string)
-			if expired && !strings.HasPrefix(sessionKey, "topic:") {
-				slog.Info("session expired", "session_key", key)
-				r.mu.Delete(key)
-			}
-			return true
-		})
+		r.expireIdleSessions(time.Now())
 	}
+}
+
+func (r *Runner) expireIdleSessions(now time.Time) {
+	r.mu.Range(func(key, value any) bool {
+		info := value.(*sessionInfo)
+		if !info.runMu.TryLock() {
+			return true
+		}
+		info.mu.Lock()
+		reset := info.status == sessionStatusReset
+		expired := now.Sub(info.lastUsed) > r.maxIdle
+		info.mu.Unlock()
+		sessionKey, _ := key.(string)
+		if reset || (expired && !strings.HasPrefix(sessionKey, "topic:")) {
+			slog.Info("session expired", "session_key", key)
+			r.mu.CompareAndDelete(key, info)
+		}
+		info.runMu.Unlock()
+		return true
+	})
 }

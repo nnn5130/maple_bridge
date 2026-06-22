@@ -266,6 +266,73 @@ func TestRedactSensitiveHidesAPIKeys(t *testing.T) {
 	}
 }
 
+func TestManagedProcessIdentityMatchesFullIdentity(t *testing.T) {
+	t.Parallel()
+
+	proc := &managedProcess{
+		Command:          "npm run dev",
+		ProcessStartedAt: "Mon Jun 22 17:17:40 2026",
+		ProcessGroupID:   1234,
+		ProcessCommand:   "bash -lc npm run dev",
+	}
+	identity := processIdentity{
+		StartedAt: "Mon Jun 22 17:17:40 2026",
+		GroupID:   1234,
+		Command:   "bash -lc npm run dev",
+	}
+	if !managedProcessIdentityMatches(proc, identity) {
+		t.Fatal("expected identity to match")
+	}
+}
+
+func TestManagedProcessIdentityRejectsReusedPID(t *testing.T) {
+	t.Parallel()
+
+	proc := &managedProcess{
+		Command:          "npm run dev",
+		ProcessStartedAt: "Mon Jun 22 17:17:40 2026",
+		ProcessGroupID:   1234,
+		ProcessCommand:   "bash -lc npm run dev",
+	}
+	identity := processIdentity{
+		StartedAt: "Mon Jun 22 17:18:00 2026",
+		GroupID:   1234,
+		Command:   "bash -lc npm run dev",
+	}
+	if managedProcessIdentityMatches(proc, identity) {
+		t.Fatal("expected changed process start time to be rejected")
+	}
+}
+
+func TestManagedProcessIdentityAllowsCommandChangeWithSameStrongIdentity(t *testing.T) {
+	t.Parallel()
+
+	proc := &managedProcess{
+		Command:          "exec node server.js",
+		ProcessStartedAt: "Mon Jun 22 17:17:40 2026",
+		ProcessGroupID:   1234,
+		ProcessCommand:   "bash -lc exec node server.js",
+	}
+	identity := processIdentity{
+		StartedAt: "Mon Jun 22 17:17:40 2026",
+		GroupID:   1234,
+		Command:   "node server.js",
+	}
+	if !managedProcessIdentityMatches(proc, identity) {
+		t.Fatal("expected same process identity to survive command changes")
+	}
+}
+
+func TestManagedProcessIdentityFallsBackForOldRecords(t *testing.T) {
+	t.Parallel()
+
+	proc := &managedProcess{Command: "npm run dev"}
+	identity := processIdentity{Command: "bash -lc npm run dev"}
+	if !managedProcessIdentityMatches(proc, identity) {
+		t.Fatal("expected old process record to fall back to command matching")
+	}
+}
+
 func TestExtractTextFromPostContent(t *testing.T) {
 	t.Parallel()
 

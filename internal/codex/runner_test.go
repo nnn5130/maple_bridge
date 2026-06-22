@@ -1,9 +1,12 @@
 package codex
 
 import (
+	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -137,6 +140,50 @@ func TestPersistentSessionResetRemovesStoredState(t *testing.T) {
 	}
 }
 
+func TestRunTimesOut(t *testing.T) {
+	t.Parallel()
+
+	workspace := t.TempDir()
+	script := filepath.Join(workspace, "codex-stub.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 2\n"), 0o755); err != nil {
+		t.Fatalf("write codex stub: %v", err)
+	}
+
+	runner := NewRunner(script, workspace, 30)
+	runner.runTimeout = 10 * time.Millisecond
+	t.Cleanup(runner.Close)
+
+	_, err := runner.Run(context.Background(), "chat:timeout", false, "hello", false)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected timeout error, got %v", err)
+	}
+}
+
+func TestCleanupRemovesResetSessionOnlyWhenNotRunning(t *testing.T) {
+	t.Parallel()
+
+	runner := NewRunner("codex", t.TempDir(), 30)
+	t.Cleanup(runner.Close)
+	key := "chat:reset"
+	info := runner.getOrCreate(key, false)
+
+	info.runMu.Lock()
+	runner.Reset(key, false)
+	runner.expireIdleSessions(time.Now())
+	if _, ok := runner.mu.Load(key); !ok {
+		t.Fatal("running reset session should remain until run finishes")
+	}
+
+	info.runMu.Unlock()
+	runner.expireIdleSessions(time.Now())
+	if _, ok := runner.mu.Load(key); ok {
+		t.Fatal("reset session should be removed after run finishes")
+	}
+}
+
 func TestCodexFailureErrorTruncatesOutput(t *testing.T) {
 	t.Parallel()
 
@@ -147,6 +194,22 @@ func TestCodexFailureErrorTruncatesOutput(t *testing.T) {
 	}
 	if len(text) > commandErrorLimit*3 {
 		t.Fatalf("error text is unexpectedly large: %d", len(text))
+	}
+}
+
+func TestLimitedBufferWriteReportsOriginalLength(t *testing.T) {
+	t.Parallel()
+
+	buf := newLimitedBuffer(3)
+	n, err := buf.Write([]byte("abcdef"))
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if n != 6 {
+		t.Fatalf("expected original write length 6, got %d", n)
+	}
+	if got := buf.String(); !strings.Contains(got, "abc") || !strings.Contains(got, "truncated") {
+		t.Fatalf("unexpected buffer text: %q", got)
 	}
 }
 
